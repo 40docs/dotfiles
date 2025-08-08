@@ -181,6 +181,71 @@ handle_error() {
     exit $exit_code
 }
 
+# Set proper ownership helper function
+set_ownership() {
+    local path="$1"
+    local recursive="${2:-false}"
+    
+    if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
+        if [[ "$recursive" == "true" ]]; then
+            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$path"
+        else
+            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$path"
+        fi
+    fi
+}
+
+# Add or update line in shell configuration file
+add_to_shell_config() {
+    local config_file="$1"
+    local line_to_add="$2"
+    local search_pattern="$3"
+    local description="$4"
+    
+    if [[ -f "$config_file" ]]; then
+        if ! grep -q "$search_pattern" "$config_file"; then
+            log "INFO" "Adding $description to $(basename "$config_file")"
+            echo "$line_to_add" >> "$config_file"
+            set_ownership "$config_file"
+        else
+            log "INFO" "$description already exists in $(basename "$config_file")"
+        fi
+    else
+        log "WARN" "$(basename "$config_file") not found, skipping $description setup"
+    fi
+}
+
+# Download file with retry and proper ownership
+download_file() {
+    local url="$1"
+    local output="$2"
+    local description="${3:-file}"
+    
+    log "INFO" "Downloading $description from $url"
+    retry_network_operation curl -fsSL "$url" -o "$output"
+    set_ownership "$output"
+}
+
+# Install plugin collection from associative array
+install_plugin_collection() {
+    local -n plugin_array=$1
+    local base_dir="$2"
+    local description="$3"
+    
+    log "INFO" "Installing $description..."
+    for plugin in "${!plugin_array[@]}"; do
+        local plugin_dir="$base_dir/$plugin"
+        local clone_args=""
+        
+        # Special handling for plugins that need shallow clone
+        if [[ "$plugin" == "vim-polyglot" ]]; then
+            clone_args="--depth 1"
+        fi
+        
+        git_clone_or_update_user "${plugin_array[$plugin]}" "$plugin_dir" "$clone_args"
+    done
+}
+
 # Set up error trap
 trap 'handle_error $LINENO' ERR
 
@@ -379,9 +444,7 @@ safe_mkdir_user() {
         }
 
         # Set proper ownership if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$dir"
-        fi
+        set_ownership "$dir" true
     fi
 }
 
@@ -399,9 +462,7 @@ safe_copy_user() {
         cp "$dest" "$dest$backup_ext"
 
         # Set proper ownership for backup if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$dest$backup_ext"
-        fi
+        set_ownership "$dest$backup_ext"
     fi
 
     log "INFO" "Copying $src -> $dest"
@@ -411,9 +472,7 @@ safe_copy_user() {
     }
 
     # Set proper ownership if running as root
-    if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-        chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$dest"
-    fi
+    set_ownership "$dest"
 }
 
 # Git clone or update with user context
@@ -433,9 +492,7 @@ git_clone_or_update_user() {
         }
 
         # Set ownership if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$target_dir"
-        fi
+        set_ownership "$target_dir" true
     else
         log "INFO" "Updating repository in $target_dir"
         # Enhanced git update with branch handling
@@ -510,98 +567,66 @@ fi
 # Log the value of XDG_CACHE_HOME for debugging
 log "INFO" "XDG_CACHE_HOME is set to: $XDG_CACHE_HOME"
 
-# Ensure $HOME/.local/bin is in PATH in ~/.zshrc and ~/.bashrc (append if not present)
-for shellrc in "$TARGET_HOME/.zshrc" "$TARGET_HOME/.bashrc"; do
-    if [[ -f "$shellrc" ]]; then
-        # Use $HOME variable in the actual export line
-        home_localbin_export='export PATH=$PATH:$HOME/.local/bin'
-
-        # Check if any .local/bin PATH export already exists (either with $HOME or hardcoded)
-        if ! grep -q "export PATH=.*\.local/bin" "$shellrc"; then
-            log "INFO" "Adding \$HOME/.local/bin to PATH in $shellrc"
-            echo "$home_localbin_export" >> "$shellrc"
-
-            # Set proper ownership if running as root
-            if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$shellrc"
-            fi
-        else
-            # Check if it's using hardcoded path and replace it
-            if grep -q "export PATH=.*${TARGET_USER}.*\.local/bin" "$shellrc" && ! grep -q "export PATH=.*\$HOME.*\.local/bin" "$shellrc"; then
-                log "INFO" "Replacing hardcoded path with \$HOME variable in $shellrc"
-                # Create a backup
-                cp "$shellrc" "$shellrc.backup.$(date +%Y%m%d_%H%M%S)"
-
-                # Replace hardcoded path with $HOME version
-                sed -i "s|export PATH=\$PATH:[^:]*${TARGET_USER}[^:]*\.local/bin|${home_localbin_export}|g" "$shellrc"
-
-                # Set proper ownership if running as root
-                if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-                    chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$shellrc"
-                fi
-            fi
-        fi
-
-        # Add GitHub CLI pager configuration (disable pager for headless environments)
-        gh_pager_export='export GH_PAGER='
-        if ! grep -q "export GH_PAGER=" "$shellrc"; then
-            log "INFO" "Adding GitHub CLI pager configuration to $shellrc"
-            echo "$gh_pager_export" >> "$shellrc"
-
-            # Set proper ownership if running as root
-            if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$shellrc"
-            fi
-        else
-            log "INFO" "GitHub CLI pager configuration already exists in $shellrc"
+# Setup shell configuration function
+setup_shell_config() {
+    local shellrc="$1"
+    
+    if [[ ! -f "$shellrc" ]]; then
+        return 0
+    fi
+    
+    # Add $HOME/.local/bin to PATH
+    local home_localbin_export='export PATH=$PATH:$HOME/.local/bin'
+    if ! grep -q "export PATH=.*\.local/bin" "$shellrc"; then
+        add_to_shell_config "$shellrc" "$home_localbin_export" "export PATH=.*\.local/bin" "\$HOME/.local/bin to PATH"
+    else
+        # Check if it's using hardcoded path and replace it
+        if grep -q "export PATH=.*${TARGET_USER}.*\.local/bin" "$shellrc" && ! grep -q "export PATH=.*\$HOME.*\.local/bin" "$shellrc"; then
+            log "INFO" "Replacing hardcoded path with \$HOME variable in $shellrc"
+            # Create a backup
+            cp "$shellrc" "$shellrc.backup.$(date +%Y%m%d_%H%M%S)"
+            # Replace hardcoded path with $HOME version
+            sed -i "s|export PATH=\$PATH:[^:]*${TARGET_USER}[^:]*\.local/bin|${home_localbin_export}|g" "$shellrc"
+            set_ownership "$shellrc"
         fi
     fi
+    
+    # Add GitHub CLI pager configuration
+    add_to_shell_config "$shellrc" 'export GH_PAGER=' "export GH_PAGER=" "GitHub CLI pager configuration"
+}
+
+# Apply shell configuration to both zsh and bash
+for shellrc in "$TARGET_HOME/.zshrc" "$TARGET_HOME/.bashrc"; do
+    setup_shell_config "$shellrc"
 done
 
-# Add VSCode shell integration to .bashrc and .zshrc
+# Setup VSCode shell integration
 log "INFO" "Setting up VSCode shell integration..."
 
-# Configure VSCode shell integration for .bashrc
-bashrc_file="$TARGET_HOME/.bashrc"
-vscode_bash_integration='[[ "$TERM_PROGRAM" == "vscode" ]] && . "$(code --locate-shell-integration-path bash)"'
-if [[ -f "$bashrc_file" ]]; then
-    if ! grep -qF 'TERM_PROGRAM.*vscode.*locate-shell-integration-path.*bash' "$bashrc_file"; then
-        log "INFO" "Adding VSCode shell integration to .bashrc"
-        echo "" >> "$bashrc_file"
-        echo "# VSCode shell integration" >> "$bashrc_file"
-        echo "$vscode_bash_integration" >> "$bashrc_file"
-
-        # Set proper ownership if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$bashrc_file"
+setup_vscode_integration() {
+    local shell_type="$1"
+    local shell_file="$TARGET_HOME/.${shell_type}rc"
+    local integration_line="[[ \"\$TERM_PROGRAM\" == \"vscode\" ]] && . \"\$(code --locate-shell-integration-path $shell_type)\""
+    
+    if [[ -f "$shell_file" ]]; then
+        if ! grep -qF "TERM_PROGRAM.*vscode.*locate-shell-integration-path.*$shell_type" "$shell_file"; then
+            log "INFO" "Adding VSCode shell integration to .$shell_type" "rc"
+            {
+                echo ""
+                echo "# VSCode shell integration" 
+                echo "$integration_line"
+            } >> "$shell_file"
+            set_ownership "$shell_file"
+        else
+            log "INFO" "VSCode shell integration already configured in .$shell_type" "rc"
         fi
     else
-        log "INFO" "VSCode shell integration already configured in .bashrc"
+        log "WARN" ".$shell_type" "rc not found, skipping VSCode shell integration setup"
     fi
-else
-    log "WARN" ".bashrc not found, skipping VSCode shell integration setup for bash"
-fi
+}
 
-# Configure VSCode shell integration for .zshrc
-zshrc_file="$TARGET_HOME/.zshrc"
-vscode_zsh_integration='[[ "$TERM_PROGRAM" == "vscode" ]] && . "$(code --locate-shell-integration-path zsh)"'
-if [[ -f "$zshrc_file" ]]; then
-    if ! grep -qF 'TERM_PROGRAM.*vscode.*locate-shell-integration-path.*zsh' "$zshrc_file"; then
-        log "INFO" "Adding VSCode shell integration to .zshrc"
-        echo "" >> "$zshrc_file"
-        echo "# VSCode shell integration" >> "$zshrc_file"
-        echo "$vscode_zsh_integration" >> "$zshrc_file"
-
-        # Set proper ownership if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$zshrc_file"
-        fi
-    else
-        log "INFO" "VSCode shell integration already configured in .zshrc"
-    fi
-else
-    log "WARN" ".zshrc not found, skipping VSCode shell integration setup for zsh"
-fi
+setup_vscode_integration "bash"
+setup_vscode_integration "zsh"
 
 log "INFO" "VSCode shell integration setup completed"
 
@@ -610,7 +635,10 @@ log "INFO" "Working directory: ${DOTFILEDIR}"
 
 log "INFO" "Copying configuration files to home directory..."
 
-sed -i 's/^ZSH_THEME="[^"]*"/ZSH_THEME="agnoster"/' "$TARGET_HOME/.zshrc"
+# Update ZSH theme if .zshrc exists
+if [[ -f "$TARGET_HOME/.zshrc" ]]; then
+    sed -i 's/^ZSH_THEME="[^"]*"/ZSH_THEME="agnoster"/' "$TARGET_HOME/.zshrc"
+fi
 
 # List of configuration files to copy
 declare -a config_files=(
@@ -659,21 +687,12 @@ if [[ -d "$vscode_dir" ]]; then
     log "INFO" "Backing up existing $vscode_dir directory..."
     backup_ext=".backup.$(date +%Y%m%d_%H%M%S)"
     mv "$vscode_dir" "$vscode_dir$backup_ext"
-
-    # Set proper ownership for backup if running as root
-    if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$vscode_dir$backup_ext"
-    fi
+    set_ownership "$vscode_dir$backup_ext" true
 fi
 
 if [[ -d .vscode ]]; then
     cp -a .vscode "$vscode_dir"
-
-    # Set proper ownership if running as root
-    if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-        chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$vscode_dir"
-    fi
-
+    set_ownership "$vscode_dir" true
     log "INFO" "VSCode configuration set up successfully"
 else
     log "WARN" "VSCode configuration directory not found in dotfiles"
@@ -714,27 +733,13 @@ else
         ["vim-code-dark"]="https://github.com/tomasiser/vim-code-dark"
     )
 
-    # Install/update Vim plugins
-    for plugin in "${!vim_plugins[@]}"; do
-        plugin_dir="$TARGET_HOME/.vim/pack/plugin/start/$plugin"
-        clone_args=""
-
-        # Use shallow clone for vim-polyglot
-        if [[ "$plugin" == "vim-polyglot" ]]; then
-            clone_args="--depth 1"
-        fi
-
-        git_clone_or_update_user "${vim_plugins[$plugin]}" "$plugin_dir" "$clone_args"
-    done
-
+    # Install/update Vim plugins and themes
+    install_plugin_collection vim_plugins "$TARGET_HOME/.vim/pack/plugin/start" "Vim plugins"
+    install_plugin_collection vim_themes "$TARGET_HOME/.vim/pack/themes/start" "Vim themes"
+    
     # Special handling for vim-polyglot with shallow clone
     git_clone_or_update_user "https://github.com/sheerun/vim-polyglot" \
         "$TARGET_HOME/.vim/pack/plugin/start/vim-polyglot" "--depth 1"
-
-    # Install/update Vim themes
-    for theme in "${!vim_themes[@]}"; do
-        git_clone_or_update_user "${vim_themes[$theme]}" "$TARGET_HOME/.vim/pack/themes/start/$theme"
-    done
 fi
 
 log "INFO" "Vim plugins and themes set up successfully"
@@ -773,17 +778,13 @@ if [[ ! -f "$zshrc_file" ]]; then
         cp "$template_file" "$zshrc_file"
 
         # Set proper ownership if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$zshrc_file"
-        fi
+        set_ownership "$zshrc_file"
     else
         log "WARN" "Oh My Zsh template not found, creating basic .zshrc"
         echo "# Basic zshrc configuration" > "$zshrc_file"
 
         # Set proper ownership if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$zshrc_file"
-        fi
+        set_ownership "$zshrc_file"
     fi
 else
     log "INFO" ".zshrc already exists"
@@ -804,9 +805,7 @@ if (( BASH_VERSINFO[0] >= 4 )); then
     )
 
     # Install/update Zsh plugins
-    for plugin in "${!zsh_plugins[@]}"; do
-        git_clone_or_update_user "${zsh_plugins[$plugin]}" "$oh_my_zsh_dir/custom/plugins/$plugin"
-    done
+    install_plugin_collection zsh_plugins "$oh_my_zsh_dir/custom/plugins" "Zsh plugins"
 else
     log "WARN" "Bash version ${BASH_VERSION} detected. Installing Zsh plugins individually without associative arrays."
 
@@ -823,6 +822,7 @@ az_completion_file="$oh_my_zsh_dir/custom/az.zsh"
 run_as_user_with_home "curl -fsSL 'https://raw.githubusercontent.com/Azure/azure-cli/dev/az.completion' -o '$az_completion_file'" || {
     retry_network_operation run_as_user_with_home "curl -fsSL 'https://raw.githubusercontent.com/Azure/azure-cli/dev/az.completion' -o '$az_completion_file'"
 }
+set_ownership "$az_completion_file"
 
 log "INFO" "Zsh and Oh My Zsh set up successfully"
 
@@ -847,9 +847,7 @@ if [[ -f "$zshrc_file" ]]; then
             exit 3
         }
         # Set proper ownership if running as root
-        if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$zshrc_file"
-        fi
+        set_ownership "$zshrc_file"
     else
         log "ERROR" "Failed to modify .zshrc content"
         exit 3
@@ -948,9 +946,7 @@ if [[ "$(uname)" == "Linux" ]]; then
             }
 
             # Set proper ownership and permissions
-            if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
-                chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$TARGET_HOME/.local/bin/lsd"
-            fi
+            set_ownership "$TARGET_HOME/.local/bin/lsd"
             chmod +x "$TARGET_HOME/.local/bin/lsd"
         )
 
