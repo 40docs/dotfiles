@@ -610,7 +610,7 @@ log "INFO" "Working directory: ${DOTFILEDIR}"
 
 log "INFO" "Copying configuration files to home directory..."
 
-sed -i 's/^ZSH_THEME="[^"]*"/ZSH_THEME="agnoster"/' ~/.zshrc
+sed -i 's/^ZSH_THEME="[^"]*"/ZSH_THEME="agnoster"/' "$TARGET_HOME/.zshrc"
 
 # List of configuration files to copy
 declare -a config_files=(
