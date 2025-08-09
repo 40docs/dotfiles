@@ -666,6 +666,7 @@ declare -a config_files=(
     ".tmux.conf"
     ".p10k.zsh"
     ".digrc"
+    ".gitconfig"
 )
 
 # Copy configuration files safely
