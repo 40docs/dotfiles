@@ -662,33 +662,37 @@ done
 log "INFO" "Configuration files copied successfully"
 
 # --- Claude config setup ---
+log "INFO" "Setting up Claude Code configuration..."
+
 claude_dir="$TARGET_HOME/.claude"
-claude_settings_src="./claude/settings.json"
-claude_settings_dest="$claude_dir/settings.json"
+claude_source_dir="./.claude"
 
 # Create ~/.claude if it does not exist
 if [[ ! -d "$claude_dir" ]]; then
     safe_mkdir_user "$claude_dir"
-    log "INFO" "Created $claude_dir directory."
+    log "INFO" "Created $claude_dir directory"
 fi
 
-# Copy settings.json if present
-if [[ -f "$claude_settings_src" ]]; then
-    safe_copy_user "$claude_settings_src" "$claude_settings_dest"
-    log "INFO" "Copied $claude_settings_src to $claude_settings_dest."
-else
-    log "WARN" "$claude_settings_src not found, skipping Claude settings copy."
-fi
+# List of Claude configuration files to copy
+declare -a claude_config_files=(
+    "settings.json"
+    "mcp.json"
+)
 
-# Copy mcp.json if present
-claude_mcp_src="./.claude/mcp.json"
-claude_mcp_dest="$claude_dir/mcp.json"
-if [[ -f "$claude_mcp_src" ]]; then
-    safe_copy_user "$claude_mcp_src" "$claude_mcp_dest"
-    log "INFO" "Copied $claude_mcp_src to $claude_mcp_dest."
-else
-    log "WARN" "$claude_mcp_src not found, skipping Claude MCP config copy."
-fi
+# Copy Claude configuration files
+for config_file in "${claude_config_files[@]}"; do
+    source_file="$claude_source_dir/$config_file"
+    dest_file="$claude_dir/$config_file"
+    
+    if [[ -f "$source_file" ]]; then
+        safe_copy_user "$source_file" "$dest_file"
+        log "INFO" "Copied Claude $config_file configuration"
+    else
+        log "WARN" "Claude $config_file not found at $source_file, skipping"
+    fi
+done
+
+log "INFO" "Claude Code configuration setup completed"
 
 log "INFO" "Setting up VSCode configuration..."
 vscode_dir="$TARGET_HOME/.vscode"
