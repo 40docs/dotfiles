@@ -604,7 +604,7 @@ setup_shell_config() {
             # Create a backup
             cp "$shellrc" "$shellrc.backup.$(date +%Y%m%d_%H%M%S)"
             # Replace hardcoded path with $HOME version
-            sed -i "s|export PATH=\$PATH:[^:]*${TARGET_USER}[^:]*\.local/bin|${home_localbin_export}|g" "$shellrc"
+            sed -i '' "s|export PATH=\$PATH:[^:]*${TARGET_USER}[^:]*\.local/bin|${home_localbin_export}|g" "$shellrc"
             set_ownership "$shellrc"
         fi
     fi
@@ -655,7 +655,7 @@ log "INFO" "Copying configuration files to home directory..."
 
 # Update ZSH theme if .zshrc exists
 if [[ -f "$TARGET_HOME/.zshrc" ]]; then
-    sed -i 's/^ZSH_THEME="[^"]*"/ZSH_THEME="agnoster"/' "$TARGET_HOME/.zshrc"
+    sed -i '' 's/^ZSH_THEME="[^"]*"/ZSH_THEME="agnoster"/' "$TARGET_HOME/.zshrc"
 fi
 
 # List of configuration files to copy
