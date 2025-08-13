@@ -228,22 +228,47 @@ download_file() {
 
 # Install plugin collection from associative array
 install_plugin_collection() {
-    local -n plugin_array=$1
+    local array_name="$1"
     local base_dir="$2"
     local description="$3"
     
     log "INFO" "Installing $description..."
-    for plugin in "${!plugin_array[@]}"; do
-        local plugin_dir="$base_dir/$plugin"
-        local clone_args=""
+    
+    # Check if we can use nameref (bash 4.3+)
+    if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+        # Use nameref for bash 4.3+
+        local -n plugin_array=$array_name
+        for plugin in "${!plugin_array[@]}"; do
+            local plugin_dir="$base_dir/$plugin"
+            local clone_args=""
+            
+            # Special handling for plugins that need shallow clone
+            if [[ "$plugin" == "vim-polyglot" ]]; then
+                clone_args="--depth 1"
+            fi
+            
+            git_clone_or_update_user "${plugin_array[$plugin]}" "$plugin_dir" "$clone_args"
+        done
+    else
+        # Fallback for older bash versions - use eval
+        log "WARN" "Bash version ${BASH_VERSION} detected. Using eval fallback for associative arrays."
+        local plugin_keys
+        plugin_keys=$(eval "echo \"\${!${array_name}[@]}\"")
         
-        # Special handling for plugins that need shallow clone
-        if [[ "$plugin" == "vim-polyglot" ]]; then
-            clone_args="--depth 1"
-        fi
-        
-        git_clone_or_update_user "${plugin_array[$plugin]}" "$plugin_dir" "$clone_args"
-    done
+        for plugin in $plugin_keys; do
+            local plugin_dir="$base_dir/$plugin"
+            local plugin_url
+            plugin_url=$(eval "echo \"\${${array_name}[$plugin]}\"")
+            local clone_args=""
+            
+            # Special handling for plugins that need shallow clone
+            if [[ "$plugin" == "vim-polyglot" ]]; then
+                clone_args="--depth 1"
+            fi
+            
+            git_clone_or_update_user "$plugin_url" "$plugin_dir" "$clone_args"
+        done
+    fi
 }
 
 # Find Claude binary across different installation methods
@@ -1311,6 +1336,7 @@ else
         ["vim-gitgutter"]="https://github.com/airblade/vim-gitgutter.git"
         ["vim-fugitive"]="https://github.com/tpope/vim-fugitive.git"
         ["vim-terraform"]="https://github.com/hashivim/vim-terraform.git"
+        ["vim-polyglot"]="https://github.com/sheerun/vim-polyglot"
     )
 
     # Vim themes configuration
@@ -1321,10 +1347,6 @@ else
     # Install/update Vim plugins and themes
     install_plugin_collection vim_plugins "$TARGET_HOME/.vim/pack/plugin/start" "Vim plugins"
     install_plugin_collection vim_themes "$TARGET_HOME/.vim/pack/themes/start" "Vim themes"
-    
-    # Special handling for vim-polyglot with shallow clone
-    git_clone_or_update_user "https://github.com/sheerun/vim-polyglot" \
-        "$TARGET_HOME/.vim/pack/plugin/start/vim-polyglot" "--depth 1"
 fi
 
 log "INFO" "Vim plugins and themes set up successfully"
