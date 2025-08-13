@@ -1311,12 +1311,17 @@ fi
 #cp .continue/config.json ~/.continue
 
 log "INFO" "Setting up tmux plugins..."
+safe_mkdir_user "$TARGET_HOME/.tmux"
 safe_mkdir_user "$TARGET_HOME/.tmux/plugins"
 
 git_clone_or_update_user "https://github.com/tmux-plugins/tpm" "$TARGET_HOME/.tmux/plugins/tpm"
 log "INFO" "Tmux plugins set up successfully"
 
 log "INFO" "Setting up Vim plugins and themes..."
+safe_mkdir_user "$TARGET_HOME/.vim"
+safe_mkdir_user "$TARGET_HOME/.vim/pack"
+safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin"
+safe_mkdir_user "$TARGET_HOME/.vim/pack/themes"
 safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin/start"
 safe_mkdir_user "$TARGET_HOME/.vim/pack/themes/start"
 
@@ -1464,6 +1469,7 @@ log "INFO" "Zsh plugins configured successfully"
 
 log "INFO" "Setting up Oh My Posh prompt theme..."
 safe_mkdir_user "$TARGET_HOME/.local/bin"
+safe_mkdir_user "$TARGET_HOME/.oh-my-posh"
 safe_mkdir_user "$TARGET_HOME/.oh-my-posh/themes"
 
 log "INFO" "Installing Oh My Posh..."
