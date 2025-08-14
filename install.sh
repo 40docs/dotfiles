@@ -40,10 +40,10 @@ SCRIPT_USER=""
 detect_execution_context() {
     SCRIPT_USER="$(whoami)"
 
-    # Check if running as root (typical in cloud-init)
+    # Don't automatically set CLOUD_INIT_MODE when running as root
+    # Let the command line arguments or environment variables determine this
     if [[ "$EUID" -eq 0 ]]; then
-        log "INFO" "Running as root - cloud-init or sudo execution detected"
-        CLOUD_INIT_MODE=true
+        log "INFO" "Running as root user"
     fi
 
     # Check for CI/automation indicators
@@ -880,18 +880,27 @@ get_user_home() {
     fi
 }
 
-# Cross-platform get user by UID
+# Cross-platform get user by minimum UID
 get_user_by_uid() {
-    local uid="$1"
+    local min_uid="$1"
     if command_exists getent; then
-        # Linux with getent
-        getent passwd "$uid" | cut -d: -f1
+        # Linux with getent - find first user with UID >= min_uid
+        getent passwd | awk -F: -v min_uid="$min_uid" '$3 >= min_uid { print $1; exit }'
     elif [[ "$(uname)" == "Darwin" ]]; then
-        # macOS
-        dscl . -search /Users UniqueID "$uid" 2>/dev/null | head -1 | awk '{print $1}'
+        # macOS - find first user with UID >= min_uid
+        dscl . -list /Users UniqueID | awk -v min_uid="$min_uid" '$2 >= min_uid { print $1; exit }'
     else
-        # Fallback
-        id -un "$uid" 2>/dev/null
+        # Fallback - try to find a user with UID >= min_uid
+        # This is a best-effort approach when getent is not available
+        local users_found=""
+        for user in $(cut -d: -f1 /etc/passwd); do
+            local user_uid
+            user_uid=$(id -u "$user" 2>/dev/null || echo "0")
+            if [[ "$user_uid" -ge "$min_uid" ]]; then
+                echo "$user"
+                return 0
+            fi
+        done
     fi
 }
 
