@@ -541,7 +541,21 @@ check_mcp_dependencies() {
     return 0
 }
 
-# Install NPM packages globally for MCP servers
+# Check if NPM package is installed globally
+is_npm_package_installed_globally() {
+    local package_name="$1"
+    
+    # Check if package is installed globally using npm list -g
+    if [[ "$EUID" -eq 0 ]]; then
+        # Running as root - check system-wide global packages
+        npm list -g --depth=0 "$package_name" >/dev/null 2>&1
+    else
+        # Running as non-root user - check user's global packages
+        run_as_user_with_home "npm list -g --depth=0 '$package_name'" >/dev/null 2>&1
+    fi
+}
+
+# Install NPM packages for MCP servers with proper root/non-root handling
 install_mcp_server_package() {
     local server_name="$1"
     local package_name="$2"
@@ -551,14 +565,32 @@ install_mcp_server_package() {
         return 1
     fi
     
-    log "INFO" "Installing MCP server package: $server_name ($package_name)"
-    
-    # Try to install the package globally
-    if run_as_user_with_home "npm install -g '$package_name'" >/dev/null 2>&1; then
-        log "INFO" "Successfully installed MCP server: $server_name"
-        return 0
+    if [[ "$EUID" -eq 0 ]]; then
+        # Running as root - check if already installed globally, then install globally
+        if is_npm_package_installed_globally "$package_name"; then
+            log "INFO" "MCP server package already installed globally: $server_name ($package_name)"
+            return 0
+        fi
+        
+        log "INFO" "Installing MCP server package globally as root: $server_name ($package_name)"
+        if npm install -g "$package_name" >/dev/null 2>&1; then
+            log "INFO" "Successfully installed MCP server globally: $server_name"
+            return 0
+        else
+            log "WARN" "Failed to install MCP server package globally: $server_name"
+            return 1
+        fi
     else
-        log "WARN" "Failed to install MCP server package: $server_name"
+        # Running as non-root - first check if already installed globally (system-wide)
+        if npm list -g --depth=0 "$package_name" >/dev/null 2>&1; then
+            log "INFO" "MCP server package already installed globally (system-wide): $server_name ($package_name)"
+            return 0
+        fi
+        
+        # Non-root users cannot install global packages, so skip installation
+        log "INFO" "Running as non-root user - cannot install global npm packages"
+        log "INFO" "MCP server '$server_name' ($package_name) is not installed globally"
+        log "INFO" "To install this MCP server, run as root: sudo npm install -g $package_name"
         return 1
     fi
 }
@@ -703,9 +735,9 @@ install_environment_specific_mcp_servers() {
     # Azure environment servers
     if detect_environment_condition "azure_environment"; then
         log "INFO" "Azure environment detected, installing Azure MCP servers..."
-        # Using the actual Azure MCP server from your config
-        install_mcp_server_package "azure" "@azure/mcp-darwin-arm64" || true
-        install_mcp_server_package "microsoft-learn" "@microsoft/learn-mcp" || true
+        # Use the generic Azure MCP package which includes all platform-specific versions
+        install_mcp_server_package "azure" "@azure/mcp" || true
+        log "INFO" "Microsoft Learn MCP server is available as HTTP endpoint (configured via MCP config files)"
     fi
     
     # Terraform server if terraform is available
@@ -1110,6 +1142,67 @@ safe_copy_user() {
     set_ownership "$dest"
 }
 
+# Safely merge directory contents without overwriting existing directories
+safe_merge_directory() {
+    local src_dir="$1"
+    local dest_dir="$2"
+    local description="$3"
+    local backup_existing="${4:-false}"
+    
+    if [[ ! -d "$src_dir" ]]; then
+        log "WARN" "Source directory $src_dir not found, skipping $description"
+        return 0
+    fi
+    
+    log "INFO" "Merging $description from $src_dir to $dest_dir"
+    
+    # Create destination directory if it doesn't exist
+    safe_mkdir_user "$dest_dir"
+    
+    # Use find to copy all files while preserving directory structure
+    # Exclude sensitive files that shouldn't be copied
+    find "$src_dir" -type f \( \
+        ! -name ".credentials.json" \
+        ! -path "*/logs/*" \
+        ! -path "*/shell-snapshots/*" \
+        ! -path "*/backups/*" \
+        ! -path "*/statsig/*" \
+        ! -path "*/todos/*" \
+        ! -path "*/projects/*" \
+        ! -name "*.backup.*" \
+    \) -print0 | while IFS= read -r -d '' src_file; do
+        # Calculate relative path from source directory
+        rel_path="${src_file#$src_dir/}"
+        dest_file="$dest_dir/$rel_path"
+        dest_subdir="$(dirname "$dest_file")"
+        
+        # Create subdirectory if needed
+        if [[ ! -d "$dest_subdir" ]]; then
+            safe_mkdir_user "$dest_subdir"
+        fi
+        
+        # Check if file already exists and backup if requested
+        if [[ -f "$dest_file" ]] && [[ "$backup_existing" == "true" ]]; then
+            local backup_ext=".backup.$(date +%Y%m%d_%H%M%S)"
+            log "INFO" "Backing up existing file: $dest_file -> $dest_file$backup_ext"
+            cp "$dest_file" "$dest_file$backup_ext"
+            set_ownership "$dest_file$backup_ext"
+        fi
+        
+        # Copy file and overwrite if it exists
+        if [[ -f "$dest_file" ]]; then
+            log "INFO" "Overwriting existing file: $rel_path"
+        else
+            log "INFO" "Copying file: $rel_path"
+        fi
+        cp "$src_file" "$dest_file" || {
+            log "ERROR" "Failed to copy $src_file to $dest_file"
+            continue
+        }
+        set_ownership "$dest_file"
+    done
+}
+
 # Git clone or update with user context
 git_clone_or_update_user() {
     local repo_url="$1"
@@ -1313,62 +1406,8 @@ log "INFO" "Setting up Claude Code configuration..."
 claude_dir="$TARGET_HOME/.claude"
 claude_source_dir="./.claude"
 
-# Function to copy Claude directory structure recursively
-copy_claude_directory() {
-    local src_dir="$1"
-    local dest_dir="$2"
-    local description="$3"
-    
-    if [[ ! -d "$src_dir" ]]; then
-        log "WARN" "Source directory $src_dir not found, skipping $description"
-        return 0
-    fi
-    
-    log "INFO" "Copying $description from $src_dir to $dest_dir"
-    
-    # Create destination directory if it doesn't exist
-    safe_mkdir_user "$dest_dir"
-    
-    # Use find to copy all files while preserving directory structure
-    # Exclude sensitive files that shouldn't be copied
-    find "$src_dir" -type f \( \
-        ! -name ".credentials.json" \
-        ! -path "*/logs/*" \
-        ! -path "*/shell-snapshots/*" \
-        ! -path "*/backups/*" \
-        ! -path "*/statsig/*" \
-        ! -path "*/todos/*" \
-        ! -path "*/projects/*" \
-        ! -name "*.backup.*" \
-    \) -print0 | while IFS= read -r -d '' src_file; do
-        # Calculate relative path from source directory
-        rel_path="${src_file#$src_dir/}"
-        dest_file="$dest_dir/$rel_path"
-        dest_subdir="$(dirname "$dest_file")"
-        
-        # Create subdirectory if needed
-        if [[ ! -d "$dest_subdir" ]]; then
-            safe_mkdir_user "$dest_subdir"
-        fi
-        
-        # Copy file with backup and proper ownership
-        safe_copy_user "$src_file" "$dest_file"
-        
-        log "INFO" "Copied Claude file: $rel_path"
-    done
-}
-
-
-# Backup existing .claude directory if it exists
-if [[ -d "$claude_dir" ]]; then
-    backup_ext=".backup.$(date +%Y%m%d_%H%M%S)"
-    log "INFO" "Backing up existing Claude configuration: $claude_dir -> $claude_dir$backup_ext"
-    mv "$claude_dir" "$claude_dir$backup_ext"
-    set_ownership "$claude_dir$backup_ext" true
-fi
-
-# Copy the entire .claude directory structure (excluding sensitive files)
-copy_claude_directory "$claude_source_dir" "$claude_dir" "Claude Code configuration"
+# Safely merge Claude directory contents without overwriting existing directory
+safe_merge_directory "$claude_source_dir" "$claude_dir" "Claude Code configuration" false
 
 
 # Set proper permissions and ownership for the Claude directory
@@ -1382,15 +1421,9 @@ setup_claude_symlink
 
 vscode_dir="$TARGET_HOME/.vscode"
 
-if [[ -d "$vscode_dir" ]]; then
-    backup_ext=".backup.$(date +%Y%m%d_%H%M%S)"
-    mv "$vscode_dir" "$vscode_dir$backup_ext"
-    set_ownership "$vscode_dir$backup_ext" true
-fi
-
+# Safely merge VSCode directory contents without overwriting existing directory
 if [[ -d .vscode ]]; then
-    cp -a .vscode "$vscode_dir"
-    set_ownership "$vscode_dir" true
+    safe_merge_directory ".vscode" "$vscode_dir" "VSCode configuration" false
 else
     log "WARN" "VSCode configuration directory not found in dotfiles"
 fi

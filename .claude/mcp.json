@@ -37,13 +37,9 @@
         "hashicorp/terraform-mcp-server"
       ]
     },
-    "microsoft-learn": {
-      "type": "stdio",
-      "command": "npx",
-      "args": [
-        "@microsoft/learn-mcp"
-      ],
-      "tools": ["*"]
+    "microsoft.docs.mcp": {
+      "type": "http",
+      "url": "https://learn.microsoft.com/api/mcp"
     },
     "microsoft-azure": {
       "type": "stdio",
