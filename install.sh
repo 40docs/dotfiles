@@ -1124,6 +1124,18 @@ safe_copy_user() {
 
     verify_file "$src"
 
+    # Special handling for sensitive configuration files - preserve if they contain authentication data
+    if [[ "$dest" == *"/settings.json" ]] || [[ "$dest" == *"/.credentials.json" ]] || [[ "$dest" == *"/claude_desktop_config.json" ]] || [[ "$dest" == *"/.gitconfig" ]] || [[ "$dest" == *"/.vscode/settings.json" ]]; then
+        if [[ -f "$dest" ]]; then
+            # Check if existing file contains authentication tokens or sensitive data
+            # Include VSCode-specific sensitive patterns and git helper patterns
+            if grep -q '"token"' "$dest" 2>/dev/null || grep -q '"sessionToken"' "$dest" 2>/dev/null || grep -q '"authToken"' "$dest" 2>/dev/null || grep -q '"apiKey"' "$dest" 2>/dev/null || grep -q '"credentials"' "$dest" 2>/dev/null || grep -q 'helper = !' "$dest" 2>/dev/null || grep -q '"github.copilot"' "$dest" 2>/dev/null || grep -q '"accessToken"' "$dest" 2>/dev/null || grep -q '"personal-access-token"' "$dest" 2>/dev/null; then
+                log "INFO" "Preserving existing file with authentication data: $(basename "$dest")"
+                return 0  # Skip copying this file to preserve sensitive data
+            fi
+        fi
+    fi
+
     if [[ -f "$dest" ]]; then
         log "INFO" "Backing up existing file: $dest -> $dest$backup_ext"
         cp "$dest" "$dest$backup_ext"
@@ -1160,9 +1172,8 @@ safe_merge_directory() {
     safe_mkdir_user "$dest_dir"
     
     # Use find to copy all files while preserving directory structure
-    # Exclude sensitive files that shouldn't be copied
+    # Exclude runtime/temporary files that shouldn't be copied
     find "$src_dir" -type f \( \
-        ! -name ".credentials.json" \
         ! -path "*/logs/*" \
         ! -path "*/shell-snapshots/*" \
         ! -path "*/backups/*" \
@@ -1187,6 +1198,18 @@ safe_merge_directory() {
             log "INFO" "Backing up existing file: $dest_file -> $dest_file$backup_ext"
             cp "$dest_file" "$dest_file$backup_ext"
             set_ownership "$dest_file$backup_ext"
+        fi
+        
+        # Special handling for sensitive files - preserve if they contain authentication data
+        if [[ "$dest_file" == *"/settings.json" ]] || [[ "$dest_file" == *"/.credentials.json" ]] || [[ "$dest_file" == *"/claude_desktop_config.json" ]] || [[ "$dest_file" == *"/.vscode/settings.json" ]]; then
+            if [[ -f "$dest_file" ]]; then
+                # Check if existing file contains authentication tokens or sensitive data
+                # Include VSCode-specific sensitive patterns
+                if grep -q '"token"' "$dest_file" 2>/dev/null || grep -q '"sessionToken"' "$dest_file" 2>/dev/null || grep -q '"authToken"' "$dest_file" 2>/dev/null || grep -q '"apiKey"' "$dest_file" 2>/dev/null || grep -q '"credentials"' "$dest_file" 2>/dev/null || grep -q '"github.copilot"' "$dest_file" 2>/dev/null || grep -q '"accessToken"' "$dest_file" 2>/dev/null || grep -q '"personal-access-token"' "$dest_file" 2>/dev/null; then
+                    log "INFO" "Preserving existing file with authentication data: $rel_path"
+                    continue  # Skip copying this file to preserve sensitive data
+                fi
+            fi
         fi
         
         # Copy file and overwrite if it exists
