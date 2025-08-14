@@ -51,6 +51,19 @@ detect_execution_context() {
         log "INFO" "CI/automation environment detected"
         CLOUD_INIT_MODE=true
     fi
+    
+    # Check for cloud-init execution context
+    # cloud-init runs scripts from specific directories and sets certain environment markers
+    if [[ "$EUID" -eq 0 ]] && [[ -f /var/lib/cloud/instance/boot-finished ]]; then
+        log "INFO" "Cloud-init execution detected (boot-finished marker found)"
+        CLOUD_INIT_MODE=true
+    elif [[ "$EUID" -eq 0 ]] && [[ -d /var/lib/cloud/instances ]] && [[ "${PWD}" == "/tmp"* ]]; then
+        log "INFO" "Cloud-init execution detected (running from /tmp as root)"
+        CLOUD_INIT_MODE=true
+    elif [[ -n "${CLOUD_INIT_INSTANCE_ID:-}" ]] || [[ -n "${CLOUD_INIT_DATASOURCE:-}" ]]; then
+        log "INFO" "Cloud-init execution detected (cloud-init environment variables)"
+        CLOUD_INIT_MODE=true
+    fi
 }
 
 # Parse command line arguments

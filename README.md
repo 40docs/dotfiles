@@ -74,7 +74,8 @@ runcmd:
     cd /tmp
     git clone https://github.com/40docs/dotfiles.git
     cd dotfiles
-    bash install.sh
+    # Use --cloud-init flag for proper user detection and ownership
+    bash install.sh --cloud-init
     rm -rf /tmp/dotfiles
 ```
 
