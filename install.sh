@@ -198,6 +198,32 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] [dotfiles install.sh] $*" >&2
 }
 
+# Debug logging for troubleshooting
+debug_log() {
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        log "DEBUG" "$*"
+    fi
+}
+
+# Log environment state for troubleshooting
+log_environment_state() {
+    local context="$1"
+    debug_log "=== Environment State ($context) ==="
+    debug_log "TARGET_USER: $TARGET_USER"
+    debug_log "TARGET_HOME: $TARGET_HOME"
+    debug_log "SCRIPT_USER: $SCRIPT_USER"
+    debug_log "CLOUD_INIT_MODE: $CLOUD_INIT_MODE"
+    debug_log "PWD: $(pwd)"
+    debug_log "HOME: $HOME"
+    debug_log "Git available: $(command_exists git && echo 'yes' || echo 'no')"
+    if command_exists git; then
+        debug_log "Git version: $(git --version 2>/dev/null || echo 'unknown')"
+    fi
+    debug_log "Network tools: curl=$(command_exists curl && echo 'yes' || echo 'no'), wget=$(command_exists wget && echo 'yes' || echo 'no')"
+    debug_log "Target home exists: $([[ -d "$TARGET_HOME" ]] && echo 'yes' || echo 'no')"
+    debug_log "============================="
+}
+
 # Error handling function
 handle_error() {
     local exit_code=$?
@@ -251,7 +277,145 @@ download_file() {
     set_ownership "$output"
 }
 
-# Install plugin collection from associative array
+# Validate environment before plugin installation
+validate_plugin_environment() {
+    local component_name="$1"
+    local requirements=("${@:2}")
+    
+    log "INFO" "Validating environment for $component_name installation..."
+    
+    # Check basic requirements
+    if [[ ! -d "$TARGET_HOME" ]]; then
+        log "ERROR" "Target home directory does not exist: $TARGET_HOME"
+        return 1
+    fi
+    
+    # Check if git is available
+    if ! command_exists git; then
+        log "ERROR" "Git is required for $component_name but is not available"
+        log "INFO" "Please install git and re-run the script"
+        return 1
+    fi
+    
+    # Check network connectivity for remote repositories
+    if ! check_github_connectivity; then
+        log "ERROR" "Network connectivity is required for $component_name but GitHub is not accessible"
+        if [[ "$CLOUD_INIT_MODE" == "true" ]]; then
+            log "INFO" "In cloud-init mode: Waiting 10 seconds for network to stabilize..."
+            sleep 10
+            if ! check_github_connectivity; then
+                log "ERROR" "Network connectivity still unavailable after wait"
+                return 1
+            fi
+            log "INFO" "Network connectivity restored"
+        else
+            return 1
+        fi
+    fi
+    
+    # Check specific requirements
+    for requirement in "${requirements[@]}"; do
+        case "$requirement" in
+            "bash4+")
+                if (( BASH_VERSINFO[0] < 4 )); then
+                    log "ERROR" "$component_name requires Bash 4+ but found version ${BASH_VERSION}"
+                    log "INFO" "Please upgrade Bash (e.g., 'brew install bash' on macOS)"
+                    return 1
+                fi
+                ;;
+            "oh-my-zsh")
+                if [[ ! -d "$TARGET_HOME/.oh-my-zsh" ]]; then
+                    log "ERROR" "$component_name requires Oh My Zsh but it's not installed"
+                    return 1
+                fi
+                ;;
+            *)
+                if ! command_exists "$requirement"; then
+                    log "ERROR" "$component_name requires '$requirement' but it's not available"
+                    return 1
+                fi
+                ;;
+        esac
+    done
+    
+    log "INFO" "Environment validation passed for $component_name"
+    return 0
+}
+
+# Verify plugin installation by checking for expected content
+verify_plugin_installation() {
+    local plugin_dir="$1"
+    local plugin_name="$2"
+    
+    # Basic checks that should apply to all git repositories
+    if [[ ! -d "$plugin_dir" ]]; then
+        log "ERROR" "Plugin directory does not exist: $plugin_dir"
+        return 1
+    fi
+    
+    if [[ ! -d "$plugin_dir/.git" ]]; then
+        log "ERROR" "Plugin directory is not a git repository: $plugin_dir"
+        return 1
+    fi
+    
+    # Check that the directory is not empty (except for .git)
+    local content_count
+    content_count=$(find "$plugin_dir" -mindepth 1 -maxdepth 1 ! -name '.git' | wc -l)
+    if [[ $content_count -eq 0 ]]; then
+        log "ERROR" "Plugin directory contains no content (except .git): $plugin_dir"
+        return 1
+    fi
+    
+    # Plugin-specific verification
+    case "$plugin_name" in
+        "tpm")
+            if [[ ! -f "$plugin_dir/tpm" ]]; then
+                log "ERROR" "TPM script not found in: $plugin_dir"
+                return 1
+            fi
+            ;;
+        "vim-airline")
+            if [[ ! -d "$plugin_dir/autoload" ]]; then
+                log "ERROR" "vim-airline autoload directory not found in: $plugin_dir"
+                return 1
+            fi
+            ;;
+        "nerdtree")
+            if [[ ! -f "$plugin_dir/plugin/NERD_tree.vim" ]]; then
+                log "ERROR" "NERDTree plugin file not found in: $plugin_dir"
+                return 1
+            fi
+            ;;
+        "zsh-autosuggestions")
+            if [[ ! -f "$plugin_dir/zsh-autosuggestions.zsh" ]]; then
+                log "ERROR" "zsh-autosuggestions main file not found in: $plugin_dir"
+                return 1
+            fi
+            ;;
+        "zsh-syntax-highlighting")
+            if [[ ! -f "$plugin_dir/zsh-syntax-highlighting.zsh" ]]; then
+                log "ERROR" "zsh-syntax-highlighting main file not found in: $plugin_dir"
+                return 1
+            fi
+            ;;
+        *)
+            # For unknown plugins, just check for common indicators
+            # Look for typical plugin files
+            if [[ ! -f "$plugin_dir/README.md" ]] && [[ ! -f "$plugin_dir/README" ]] && \
+               [[ ! -d "$plugin_dir/plugin" ]] && [[ ! -d "$plugin_dir/autoload" ]] && \
+               [[ ! -f "$plugin_dir/"*.vim ]] && [[ ! -f "$plugin_dir/"*.zsh ]] && \
+               [[ ! -f "$plugin_dir/"*.sh ]]; then
+                log "WARN" "Plugin may be incomplete - no common plugin files found in: $plugin_dir"
+                # Don't fail for unknown plugins, just warn
+            fi
+            ;;
+    esac
+    
+    log "DEBUG" "Plugin verification passed for: $plugin_name at $plugin_dir"
+    return 0
+}
+
+# Install plugin collection from associative array with comprehensive error handling
 install_plugin_collection() {
     local array_name="$1"
     local base_dir="$2"
@@ -259,12 +423,32 @@ install_plugin_collection() {
     
     log "INFO" "Installing $description..."
     
+    # Ensure base directory exists before starting
+    if ! safe_mkdir_user "$base_dir"; then
+        log "ERROR" "Failed to create base directory for $description: $base_dir"
+        return 1
+    fi
+    
+    local success_count=0
+    local failure_count=0
+    local total_plugins=0
+    
     # Check if we can use nameref (bash 4.3+)
     if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
         # Use nameref for bash 4.3+
         local -n plugin_array=$array_name
+        total_plugins=${#plugin_array[@]}
+        
+        if [[ $total_plugins -eq 0 ]]; then
+            log "WARN" "No plugins found in $array_name array"
+            return 0
+        fi
+        
+        log "INFO" "Found $total_plugins plugins to install for $description"
+        
         for plugin in "${!plugin_array[@]}"; do
             local plugin_dir="$base_dir/$plugin"
+            local plugin_url="${plugin_array[$plugin]}"
             local clone_args=""
             
             # Special handling for plugins that need shallow clone
@@ -272,28 +456,95 @@ install_plugin_collection() {
                 clone_args="--depth 1"
             fi
             
-            git_clone_or_update_user "${plugin_array[$plugin]}" "$plugin_dir" "$clone_args"
+            log "INFO" "Installing plugin: $plugin from $plugin_url"
+            
+            if git_clone_or_update_user "$plugin_url" "$plugin_dir" "$clone_args"; then
+                # Verify the installation by checking for content
+                if verify_plugin_installation "$plugin_dir" "$plugin"; then
+                    log "INFO" "Successfully installed and verified plugin: $plugin"
+                    ((success_count++))
+                else
+                    log "ERROR" "Plugin installation verification failed: $plugin"
+                    ((failure_count++))
+                fi
+            else
+                log "ERROR" "Failed to clone plugin: $plugin from $plugin_url"
+                ((failure_count++))
+            fi
         done
     else
-        # Fallback for older bash versions - use eval
-        log "WARN" "Bash version ${BASH_VERSION} detected. Using eval fallback for associative arrays."
+        # Enhanced fallback for older bash versions
+        log "WARN" "Bash version ${BASH_VERSION} detected. Using enhanced eval fallback for associative arrays."
+        
+        # Safer eval approach with validation
         local plugin_keys
-        plugin_keys=$(eval "echo \"\${!${array_name}[@]}\"")
+        if ! plugin_keys=$(eval "echo \"\${!${array_name}[@]}\"" 2>/dev/null); then
+            log "ERROR" "Failed to extract keys from associative array $array_name"
+            return 1
+        fi
+        
+        if [[ -z "$plugin_keys" ]]; then
+            log "WARN" "No plugin keys found in $array_name array"
+            return 0
+        fi
+        
+        # Count plugins for logging
+        total_plugins=$(echo "$plugin_keys" | wc -w)
+        log "INFO" "Found $total_plugins plugins to install for $description (using eval fallback)"
         
         for plugin in $plugin_keys; do
             local plugin_dir="$base_dir/$plugin"
             local plugin_url
-            plugin_url=$(eval "echo \"\${${array_name}[$plugin]}\"")
-            local clone_args=""
             
+            # Safer eval with validation
+            if ! plugin_url=$(eval "echo \"\${${array_name}[$plugin]}\"" 2>/dev/null); then
+                log "ERROR" "Failed to get URL for plugin: $plugin"
+                ((failure_count++))
+                continue
+            fi
+            
+            if [[ -z "$plugin_url" ]]; then
+                log "ERROR" "Empty URL for plugin: $plugin"
+                ((failure_count++))
+                continue
+            fi
+            
+            local clone_args=""
             # Special handling for plugins that need shallow clone
             if [[ "$plugin" == "vim-polyglot" ]]; then
                 clone_args="--depth 1"
             fi
             
-            git_clone_or_update_user "$plugin_url" "$plugin_dir" "$clone_args"
+            log "INFO" "Installing plugin: $plugin from $plugin_url"
+            
+            if git_clone_or_update_user "$plugin_url" "$plugin_dir" "$clone_args"; then
+                # Verify the installation by checking for content
+                if verify_plugin_installation "$plugin_dir" "$plugin"; then
+                    log "INFO" "Successfully installed and verified plugin: $plugin"
+                    ((success_count++))
+                else
+                    log "ERROR" "Plugin installation verification failed: $plugin"
+                    ((failure_count++))
+                fi
+            else
+                log "ERROR" "Failed to clone plugin: $plugin from $plugin_url"
+                ((failure_count++))
+            fi
         done
     fi
+    
+    # Report installation results
+    log "INFO" "$description installation completed: $success_count successful, $failure_count failed out of $total_plugins total"
+    
+    if [[ $failure_count -gt 0 ]]; then
+        log "WARN" "Some $description failed to install. Check the logs above for details."
+        if [[ $success_count -eq 0 ]]; then
+            log "ERROR" "All $description failed to install"
+            return 1
+        fi
+    fi
+    
+    return 0
 }
 
 # Find Claude binary across different installation methods
@@ -800,33 +1051,112 @@ setup_claude_symlink() {
 # Set up error trap
 trap 'handle_error $LINENO' ERR
 
-# Network operation with retry
+# Enhanced network operation with retry and better error handling
 retry_network_operation() {
     local max_attempts=3
     local delay=2
     local attempt=1
     local command=("$@")
+    
+    # Validate that we have a command to run
+    if [[ ${#command[@]} -eq 0 ]]; then
+        log "ERROR" "retry_network_operation called with no command"
+        return 1
+    fi
+    
+    # In cloud-init environments, increase retry attempts and delays
+    if [[ "$CLOUD_INIT_MODE" == "true" ]]; then
+        max_attempts=5
+        delay=5
+        log "INFO" "Cloud-init mode: Using extended retry parameters (max_attempts=$max_attempts, initial_delay=${delay}s)"
+    fi
+    
+    # For git operations, check connectivity first
+    if [[ "${command[0]}" =~ git|curl|wget ]] && [[ "${command[*]}" =~ github\.com|githubusercontent\.com ]]; then
+        if ! check_github_connectivity; then
+            log "ERROR" "Network connectivity check failed before attempting operation"
+            return 2
+        fi
+    fi
 
     while [[ $attempt -le $max_attempts ]]; do
-        if "${command[@]}"; then
+        log "INFO" "Attempting network operation (attempt $attempt/$max_attempts): ${command[*]}"
+        
+        # Execute command and capture both exit code and output
+        local temp_output
+        temp_output=$(mktemp)
+        local exit_code=0
+        
+        if "${command[@]}" >"$temp_output" 2>&1; then
+            log "INFO" "Network operation succeeded on attempt $attempt"
+            rm -f "$temp_output"
             return 0
         else
-            log "WARN" "Network operation failed (attempt $attempt/$max_attempts)"
+            exit_code=$?
+            local error_output
+            error_output=$(cat "$temp_output" 2>/dev/null || echo "No error output available")
+            rm -f "$temp_output"
+            
+            log "WARN" "Network operation failed (attempt $attempt/$max_attempts) with exit code $exit_code"
+            debug_log "Error output: $error_output"
+            
+            # Don't retry on certain types of errors (like permission denied)
+            if [[ $exit_code -eq 128 ]] || [[ "$error_output" =~ "Permission denied"|"authentication failed"|"Access denied" ]]; then
+                log "ERROR" "Non-retryable error detected, aborting retries"
+                return $exit_code
+            fi
+            
             if [[ $attempt -lt $max_attempts ]]; then
+                log "INFO" "Waiting ${delay}s before retry..."
                 sleep $delay
-                ((delay *= 2))  # Exponential backoff
+                ((delay *= 2))  # Exponential backoff with maximum cap
+                if [[ $delay -gt 30 ]]; then
+                    delay=30
+                fi
             fi
             ((attempt++))
         fi
     done
 
-    log "ERROR" "Network operation failed after $max_attempts attempts"
+    log "ERROR" "Network operation failed after $max_attempts attempts: ${command[*]}"
     return 2
 }
 
 # Check if command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# Check network connectivity to GitHub
+check_github_connectivity() {
+    local test_url="https://github.com"
+    log "INFO" "Checking connectivity to GitHub..."
+    
+    # Try multiple methods to check connectivity
+    if command_exists curl; then
+        if curl -fsSL --connect-timeout 10 --max-time 30 "$test_url" >/dev/null 2>&1; then
+            log "INFO" "GitHub connectivity verified via curl"
+            return 0
+        fi
+    fi
+    
+    if command_exists wget; then
+        if wget -q --timeout=30 --tries=1 "$test_url" -O /dev/null 2>/dev/null; then
+            log "INFO" "GitHub connectivity verified via wget"
+            return 0
+        fi
+    fi
+    
+    # Basic ping test (may not work in all environments)
+    if command_exists ping; then
+        if ping -c 1 -W 5 github.com >/dev/null 2>&1; then
+            log "INFO" "GitHub connectivity verified via ping"
+            return 0
+        fi
+    fi
+    
+    log "WARN" "Cannot verify connectivity to GitHub. Network operations may fail."
+    return 1
 }
 
 # Cross-platform user validation
@@ -997,20 +1327,73 @@ run_as_user() {
     fi
 }
 
-# Execute command as target user with proper HOME environment
+# Execute command as target user with proper HOME environment and enhanced error handling
 run_as_user_with_home() {
     local cmd="$*"
+    local exit_code=0
+
+    # Validate inputs
+    if [[ -z "$cmd" ]]; then
+        log "ERROR" "Command cannot be empty"
+        return 1
+    fi
+    
+    # Ensure target home directory exists and is accessible
+    if [[ ! -d "$TARGET_HOME" ]]; then
+        log "ERROR" "Target home directory does not exist: $TARGET_HOME"
+        return 1
+    fi
+    
+    # Check directory is accessible
+    if [[ "$SCRIPT_USER" != "$TARGET_USER" ]] && [[ "$EUID" -ne 0 ]]; then
+        if [[ ! -r "$TARGET_HOME" ]]; then
+            log "ERROR" "Target home directory not accessible: $TARGET_HOME"
+            return 1
+        fi
+    fi
+
+    debug_log "Executing as user '$TARGET_USER': $cmd"
 
     if [[ "$SCRIPT_USER" == "$TARGET_USER" ]]; then
-        # Same user, execute directly
-        eval "$cmd"
+        # Same user, execute directly with proper environment
+        (
+            cd "$TARGET_HOME" || {
+                log "ERROR" "Failed to change to home directory: $TARGET_HOME"
+                exit 1
+            }
+            eval "$cmd"
+        )
+        exit_code=$?
     elif [[ "$EUID" -eq 0 ]]; then
-        # Running as root, switch to target user with proper environment
-        sudo -u "$TARGET_USER" -H bash -c "cd '$TARGET_HOME' && $cmd"
+        # Running as root, switch to target user with comprehensive environment setup
+        sudo -u "$TARGET_USER" -H bash -c "
+            set -euo pipefail
+            cd '$TARGET_HOME' || {
+                echo '[ERROR] Failed to change to home directory: $TARGET_HOME' >&2
+                exit 1
+            }
+            
+            # Set up proper environment
+            export HOME='$TARGET_HOME'
+            export USER='$TARGET_USER'
+            export LOGNAME='$TARGET_USER'
+            
+            # Execute the command
+            $cmd
+        "
+        exit_code=$?
     else
         log "ERROR" "Cannot switch to user '$TARGET_USER' without root privileges"
         return 4
     fi
+    
+    if [[ $exit_code -ne 0 ]]; then
+        debug_log "Command failed with exit code $exit_code: $cmd"
+    else
+        debug_log "Command completed successfully: $cmd"
+    fi
+    
+    return $exit_code
 }
 
 # Create directory with proper ownership
@@ -1095,51 +1478,155 @@ safe_copy_user() {
     set_ownership "$dest"
 }
 
-# Git clone or update with user context
+# Enhanced git clone or update with comprehensive error handling
 git_clone_or_update_user() {
     local repo_url="$1"
     local target_dir="$2"
     local clone_args="${3:-}"
+    local max_retries=3
+    local retry_count=0
+
+    # Validate inputs
+    if [[ -z "$repo_url" ]]; then
+        log "ERROR" "Repository URL cannot be empty"
+        return 1
+    fi
+    
+    if [[ -z "$target_dir" ]]; then
+        log "ERROR" "Target directory cannot be empty"
+        return 1
+    fi
+
+    # Check if git is available
+    if ! command_exists git; then
+        log "ERROR" "Git is not available. Cannot clone repository: $repo_url"
+        return 1
+    fi
+    
+    # Verify network connectivity if this is a remote repository
+    if [[ "$repo_url" =~ ^https?:// ]]; then
+        if ! check_github_connectivity; then
+            log "ERROR" "Network connectivity issues detected. Cannot clone: $repo_url"
+            return 1
+        fi
+    fi
 
     if [[ ! -d "$target_dir" ]]; then
         log "INFO" "Cloning $repo_url to $target_dir"
+        
         # Ensure parent directory exists with proper ownership
-        safe_mkdir_user "$(dirname "$target_dir")"
+        local parent_dir="$(dirname "$target_dir")"
+        if ! safe_mkdir_user "$parent_dir"; then
+            log "ERROR" "Failed to create parent directory: $parent_dir"
+            return 1
+        fi
+        
+        # Clean up any partial clones from previous failed attempts
+        if [[ -d "$target_dir" ]]; then
+            log "WARN" "Removing incomplete clone directory: $target_dir"
+            rm -rf "$target_dir"
+        fi
 
-        run_as_user_with_home "git clone $clone_args '$repo_url' '$target_dir'" || {
-            # If git clone fails, try with retry
-            retry_network_operation run_as_user_with_home "git clone $clone_args '$repo_url' '$target_dir'"
-        }
-
-        # Set ownership if running as root
-        set_ownership "$target_dir" true
-    else
-        log "INFO" "Updating repository in $target_dir"
-        # Enhanced git update with branch handling
-        local update_cmd="cd '$target_dir' && git fetch origin --quiet && {
-            # Get the default branch from remote
-            default_branch=\$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo 'main')
-            # Check if default branch exists locally
-            if git show-ref --verify --quiet refs/heads/\$default_branch; then
-                git checkout \$default_branch --quiet 2>/dev/null || true
+        # Attempt clone with retry logic
+        while [[ $retry_count -lt $max_retries ]]; do
+            ((retry_count++))
+            log "INFO" "Clone attempt $retry_count/$max_retries for $repo_url"
+            
+            if run_as_user_with_home "git clone $clone_args '$repo_url' '$target_dir'"; then
+                log "INFO" "Successfully cloned $repo_url on attempt $retry_count"
+                
+                # Verify the clone was successful
+                if [[ -d "$target_dir/.git" ]]; then
+                    # Set ownership if running as root
+                    set_ownership "$target_dir" true
+                    
+                    # Final verification
+                    local content_count
+                    content_count=$(find "$target_dir" -mindepth 1 -maxdepth 1 ! -name '.git' | wc -l)
+                    if [[ $content_count -gt 0 ]]; then
+                        log "INFO" "Clone verification successful: $target_dir contains $content_count items"
+                        return 0
+                    else
+                        log "ERROR" "Clone appears empty (no content besides .git): $target_dir"
+                        rm -rf "$target_dir"
+                    fi
+                else
+                    log "ERROR" "Clone completed but .git directory missing: $target_dir"
+                    rm -rf "$target_dir"
+                fi
             else
-                # Create and checkout the default branch if it doesn't exist locally
-                git checkout -b \$default_branch origin/\$default_branch --quiet 2>/dev/null || {
-                    # If that fails, try to checkout the remote default branch directly
-                    git checkout origin/\$default_branch --quiet 2>/dev/null || true
-                }
+                log "WARN" "Git clone attempt $retry_count failed for $repo_url"
+                # Clean up failed clone attempt
+                if [[ -d "$target_dir" ]]; then
+                    rm -rf "$target_dir"
+                fi
             fi
-            # Now pull the latest changes
-            git pull --quiet 2>/dev/null || git reset --hard origin/\$default_branch --quiet 2>/dev/null || true
+            
+            # Wait before retry (exponential backoff)
+            if [[ $retry_count -lt $max_retries ]]; then
+                local wait_time=$((retry_count * 2))
+                log "INFO" "Waiting ${wait_time}s before retry..."
+                sleep $wait_time
+            fi
+        done
+        
+        log "ERROR" "Failed to clone repository $repo_url after $max_retries attempts"
+        return 1
+    else
+        log "INFO" "Updating existing repository in $target_dir"
+        
+        # Verify this is actually a git repository
+        if [[ ! -d "$target_dir/.git" ]]; then
+            log "ERROR" "Target directory exists but is not a git repository: $target_dir"
+            return 1
+        fi
+        
+        # Enhanced git update with proper error handling
+        local update_cmd="cd '$target_dir' && {
+            # Verify we can fetch from remote
+            if git fetch origin --quiet 2>/dev/null; then
+                # Get the default branch from remote
+                default_branch=\$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || {
+                    # Fallback: try to determine default branch
+                    git remote show origin 2>/dev/null | grep 'HEAD branch' | cut -d' ' -f5 || echo 'main'
+                })
+                
+                log "INFO" "Updating to default branch: \$default_branch"
+                
+                # Ensure we're on the right branch
+                if git show-ref --verify --quiet refs/heads/\$default_branch; then
+                    git checkout \$default_branch --quiet 2>/dev/null || true
+                else
+                    # Create and checkout the default branch if it doesn't exist locally
+                    git checkout -b \$default_branch origin/\$default_branch --quiet 2>/dev/null || {
+                        # If that fails, try to checkout the remote default branch directly
+                        git checkout origin/\$default_branch --quiet 2>/dev/null || true
+                    }
+                fi
+                
+                # Now pull the latest changes
+                if git pull --quiet 2>/dev/null; then
+                    log "INFO" "Successfully updated repository"
+                else
+                    log "WARN" "Pull failed, attempting reset"
+                    git reset --hard origin/\$default_branch --quiet 2>/dev/null || {
+                        log "ERROR" "Failed to reset repository to origin/\$default_branch"
+                        exit 1
+                    }
+                fi
+            else
+                log "ERROR" "Failed to fetch from remote repository"
+                exit 1
+            fi
         }"
 
-        run_as_user_with_home "$update_cmd" || {
-            log "WARN" "Git update failed for $target_dir, attempting fallback"
-            # Fallback: try a simple pull, and if that fails, reset to origin
-            run_as_user_with_home "cd '$target_dir' && (git pull --quiet || git fetch --quiet && git reset --hard origin/HEAD --quiet)" || {
-                log "WARN" "Repository update failed for $target_dir, but continuing installation"
-            }
-        }
+        if run_as_user_with_home "$update_cmd"; then
+            log "INFO" "Repository update completed successfully: $target_dir"
+            return 0
+        else
+            log "ERROR" "Repository update failed for $target_dir"
+            return 1
+        fi
     fi
 }
 
@@ -1393,37 +1880,79 @@ fi
 #cp .continue/config.json ~/.continue
 
 log "INFO" "Setting up tmux plugins..."
-# Ensure TARGET_HOME exists and is accessible
-if [[ ! -d "$TARGET_HOME" ]]; then
-    log "ERROR" "Target home directory does not exist: $TARGET_HOME"
-    log "INFO" "Skipping tmux setup"
-else
+log_environment_state "tmux setup"
+
+# Validate environment before proceeding with tmux setup
+if validate_plugin_environment "TMux plugins" "git"; then
     safe_mkdir_user "$TARGET_HOME/.tmux"
     safe_mkdir_user "$TARGET_HOME/.tmux/plugins"
-
-    git_clone_or_update_user "https://github.com/tmux-plugins/tpm" "$TARGET_HOME/.tmux/plugins/tpm"
-    log "INFO" "Tmux plugins set up successfully"
+    
+    log "INFO" "Attempting to clone tmux plugin manager (TPM)..."
+        if git_clone_or_update_user "https://github.com/tmux-plugins/tpm" "$TARGET_HOME/.tmux/plugins/tpm"; then
+            # Enhanced verification using the new verification function
+            if verify_plugin_installation "$TARGET_HOME/.tmux/plugins/tpm" "tpm"; then
+                log "INFO" "TPM installation completed and verified successfully"
+                log "INFO" "TPM installed at: $TARGET_HOME/.tmux/plugins/tpm"
+                
+                # Additional verification - check if TPM is executable
+                if [[ -x "$TARGET_HOME/.tmux/plugins/tpm/tpm" ]]; then
+                    log "INFO" "TPM script is executable and ready to use"
+                else
+                    log "WARN" "TPM script exists but may not be executable"
+                    # Try to fix permissions
+                    chmod +x "$TARGET_HOME/.tmux/plugins/tpm/tpm" 2>/dev/null || log "WARN" "Could not fix TPM script permissions"
+                fi
+            else
+                log "ERROR" "TPM installation verification failed"
+                log "INFO" "Tmux configuration will work, but plugins will not be available"
+            fi
+        else
+            log "ERROR" "Failed to install tmux plugin manager (TPM)"
+            log "INFO" "Tmux configuration will work, but plugins will not be available"
+            
+            # Enhanced diagnostics for troubleshooting
+            log "INFO" "=== TPM Installation Diagnostics ==="
+            log "INFO" "Target directory: $TARGET_HOME/.tmux/plugins/tpm"
+            log "INFO" "Directory exists: $([[ -d "$TARGET_HOME/.tmux/plugins/tpm" ]] && echo 'yes' || echo 'no')"
+            log "INFO" "Parent directory exists: $([[ -d "$TARGET_HOME/.tmux/plugins" ]] && echo 'yes' || echo 'no')"
+            log "INFO" "Parent directory writable: $([[ -w "$TARGET_HOME/.tmux/plugins" ]] && echo 'yes' || echo 'no')"
+            log "INFO" "Target home accessible: $([[ -d "$TARGET_HOME" && -r "$TARGET_HOME" ]] && echo 'yes' || echo 'no')"
+            if [[ -d "$TARGET_HOME/.tmux/plugins/tpm" ]]; then
+                log "INFO" "Directory contents: $(ls -la "$TARGET_HOME/.tmux/plugins/tpm" 2>/dev/null | wc -l) items"
+                if [[ -f "$TARGET_HOME/.tmux/plugins/tpm/tpm" ]]; then
+                    log "INFO" "TPM script exists but installation reported as failed"
+                else
+                    log "INFO" "TPM directory exists but script is missing"
+                fi
+            fi
+            log "INFO" "Git available: $(command_exists git && echo 'yes' || echo 'no')"
+            log "INFO" "Network connectivity: $(check_github_connectivity >/dev/null 2>&1 && echo 'ok' || echo 'failed')"
+            log "INFO" "Current user: $(whoami)"
+            log "INFO" "Target user: $TARGET_USER"
+            log "INFO" "Running as root: $([[ "$EUID" -eq 0 ]] && echo 'yes' || echo 'no')"
+            log "INFO" "================================"
+            
+        log "INFO" "To manually install TPM later, run:"
+        log "INFO" "  git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
+    fi
+else
+    log "ERROR" "Environment validation failed for TMux plugins"
+    log "INFO" "Skipping tmux plugin installation"
 fi
 
 log "INFO" "Setting up Vim plugins and themes..."
-if [[ ! -d "$TARGET_HOME" ]]; then
-    log "ERROR" "Target home directory does not exist: $TARGET_HOME"
-    log "INFO" "Skipping Vim setup"
-else
+
+# Validate environment for Vim plugins
+if validate_plugin_environment "Vim plugins" "git" "bash4+"; then
     safe_mkdir_user "$TARGET_HOME/.vim"
     safe_mkdir_user "$TARGET_HOME/.vim/pack"
     safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin"
     safe_mkdir_user "$TARGET_HOME/.vim/pack/themes"
     safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin/start"
     safe_mkdir_user "$TARGET_HOME/.vim/pack/themes/start"
-
-    # Check bash version for associative array support
-    if (( BASH_VERSINFO[0] < 4 )); then
-        log "WARN" "Bash version ${BASH_VERSION} detected. Associative arrays require Bash 4+. Skipping Vim plugin installation."
-        log "INFO" "To enable Vim plugin installation, please install Bash 4+ (e.g., 'brew install bash' on macOS)"
-    else
-        # Vim plugins configuration
-        declare -A vim_plugins=(
+    
+    # Vim plugins configuration
+    declare -A vim_plugins=(
             ["vim-airline"]="https://github.com/vim-airline/vim-airline"
             ["nerdtree"]="https://github.com/preservim/nerdtree.git"
             ["fzf"]="https://github.com/junegunn/fzf.vim.git"
@@ -1436,13 +1965,37 @@ else
         # Vim themes configuration
         declare -A vim_themes=(
             ["vim-code-dark"]="https://github.com/tomasiser/vim-code-dark"
-        )
-
-        # Install/update Vim plugins and themes
-        install_plugin_collection vim_plugins "$TARGET_HOME/.vim/pack/plugin/start" "Vim plugins"
-        install_plugin_collection vim_themes "$TARGET_HOME/.vim/pack/themes/start" "Vim themes"
-        log "INFO" "Vim plugins and themes set up successfully"
+    )
+    
+    # Install/update Vim plugins and themes with error checking
+        local vim_plugins_success=false
+        local vim_themes_success=false
+        
+        if install_plugin_collection vim_plugins "$TARGET_HOME/.vim/pack/plugin/start" "Vim plugins"; then
+            log "INFO" "Vim plugins installation completed successfully"
+            vim_plugins_success=true
+        else
+            log "ERROR" "Vim plugins installation encountered errors"
+        fi
+        
+        if install_plugin_collection vim_themes "$TARGET_HOME/.vim/pack/themes/start" "Vim themes"; then
+            log "INFO" "Vim themes installation completed successfully"
+            vim_themes_success=true
+        else
+            log "ERROR" "Vim themes installation encountered errors"
+        fi
+        
+        if [[ "$vim_plugins_success" == "true" ]] && [[ "$vim_themes_success" == "true" ]]; then
+            log "INFO" "All Vim plugins and themes set up successfully"
+        elif [[ "$vim_plugins_success" == "true" ]] || [[ "$vim_themes_success" == "true" ]]; then
+            log "WARN" "Vim setup completed with some errors - check logs above for details"
+    else
+        log "ERROR" "Vim plugins and themes installation failed"
+        log "INFO" "Vim will work with basic functionality, but plugins may not be available"
     fi
+else
+    log "ERROR" "Environment validation failed for Vim plugins"
+    log "INFO" "Skipping Vim plugin installation"
 fi
 
 log "INFO" "Setting up Zsh and Oh My Zsh..."
@@ -1450,13 +2003,46 @@ oh_my_zsh_dir="$TARGET_HOME/.oh-my-zsh"
 
 if [[ ! -d "$oh_my_zsh_dir" ]]; then
     log "INFO" "Installing Oh My Zsh..."
-    # Download and install Oh My Zsh as the target user
-    run_as_user_with_home 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended' || {
-        # Retry with network retry logic
-        retry_network_operation run_as_user_with_home 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
-    }
+    
+    # Enhanced Oh My Zsh installation with better error handling
+    local install_cmd='sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
+    
+    if run_as_user_with_home "$install_cmd"; then
+        log "INFO" "Oh My Zsh installation completed"
+    else
+        log "WARN" "Initial Oh My Zsh installation failed, retrying with network retry logic..."
+        if retry_network_operation run_as_user_with_home "$install_cmd"; then
+            log "INFO" "Oh My Zsh installation completed on retry"
+        else
+            log "ERROR" "Oh My Zsh installation failed after multiple attempts"
+            log "INFO" "Continuing without Oh My Zsh - some Zsh features may not be available"
+            # Don't fail the entire script, just skip Zsh plugin installation
+        fi
+    fi
+    
+    # Verify Oh My Zsh installation
+    if [[ -d "$oh_my_zsh_dir" ]]; then
+        # Check for essential Oh My Zsh components
+        if [[ -f "$oh_my_zsh_dir/oh-my-zsh.sh" ]]; then
+            log "INFO" "Oh My Zsh installation verified successfully"
+        else
+            log "ERROR" "Oh My Zsh directory exists but core files are missing"
+        fi
+        
+        # Ensure proper ownership
+        set_ownership "$oh_my_zsh_dir" true
+    else
+        log "ERROR" "Oh My Zsh installation failed - directory does not exist"
+    fi
 else
     log "INFO" "Oh My Zsh already installed"
+    
+    # Verify existing installation
+    if [[ -f "$oh_my_zsh_dir/oh-my-zsh.sh" ]]; then
+        log "INFO" "Existing Oh My Zsh installation verified"
+    else
+        log "WARN" "Oh My Zsh directory exists but core files may be missing"
+    fi
 fi
 
 log "INFO" "Setting up z jump tool..."
@@ -1492,14 +2078,11 @@ else
 fi
 
 log "INFO" "Setting up Zsh plugins..."
-if [[ -d "$oh_my_zsh_dir" ]]; then
-    safe_mkdir_user "$oh_my_zsh_dir/custom/plugins"
-else
-    log "WARN" "Oh My Zsh directory does not exist: $oh_my_zsh_dir"
-    log "INFO" "Skipping Zsh plugins setup"
-fi
 
-if [[ -d "$oh_my_zsh_dir/custom/plugins" ]]; then
+# Validate environment for Zsh plugins
+if validate_plugin_environment "Zsh plugins" "git" "oh-my-zsh"; then
+    safe_mkdir_user "$oh_my_zsh_dir/custom/plugins"
+    
     # Check bash version for associative array support
     if (( BASH_VERSINFO[0] >= 4 )); then
         # Zsh plugins configuration
@@ -1511,20 +2094,58 @@ if [[ -d "$oh_my_zsh_dir/custom/plugins" ]]; then
             ["zsh-aliases-lsd"]="https://github.com/yuhonas/zsh-aliases-lsd.git"
         )
 
-        # Install/update Zsh plugins
-        install_plugin_collection zsh_plugins "$oh_my_zsh_dir/custom/plugins" "Zsh plugins"
+        # Install/update Zsh plugins with error checking
+        if install_plugin_collection zsh_plugins "$oh_my_zsh_dir/custom/plugins" "Zsh plugins"; then
+            log "INFO" "Zsh plugins installation completed successfully"
+        else
+            log "ERROR" "Zsh plugins installation encountered errors"
+            log "INFO" "Zsh will work with basic functionality, but some plugins may not be available"
+        fi
     else
         log "WARN" "Bash version ${BASH_VERSION} detected. Installing Zsh plugins individually without associative arrays."
 
-        # Install plugins individually
-        git_clone_or_update_user "https://github.com/zsh-users/zsh-autosuggestions.git" "$oh_my_zsh_dir/custom/plugins/zsh-autosuggestions"
-        git_clone_or_update_user "https://github.com/zsh-users/zsh-syntax-highlighting.git" "$oh_my_zsh_dir/custom/plugins/zsh-syntax-highlighting"
-        git_clone_or_update_user "https://github.com/conda-incubator/conda-zsh-completion.git" "$oh_my_zsh_dir/custom/plugins/conda-zsh-completion"
-        git_clone_or_update_user "https://github.com/cda0/zsh-tfenv.git" "$oh_my_zsh_dir/custom/plugins/zsh-tfenv"
-        git_clone_or_update_user "https://github.com/yuhonas/zsh-aliases-lsd.git" "$oh_my_zsh_dir/custom/plugins/zsh-aliases-lsd"
+        # Install plugins individually with error checking
+        local individual_plugins=(
+            "zsh-autosuggestions:https://github.com/zsh-users/zsh-autosuggestions.git"
+            "zsh-syntax-highlighting:https://github.com/zsh-users/zsh-syntax-highlighting.git"
+            "conda-zsh-completion:https://github.com/conda-incubator/conda-zsh-completion.git"
+            "zsh-tfenv:https://github.com/cda0/zsh-tfenv.git"
+            "zsh-aliases-lsd:https://github.com/yuhonas/zsh-aliases-lsd.git"
+        )
+        
+        local success_count=0
+        local total_plugins=${#individual_plugins[@]}
+        
+        log "INFO" "Installing $total_plugins Zsh plugins individually (bash version fallback)"
+        
+        for plugin_info in "${individual_plugins[@]}"; do
+            IFS=':' read -r plugin_name plugin_url <<< "$plugin_info"
+            local plugin_dir="$oh_my_zsh_dir/custom/plugins/$plugin_name"
+            
+            log "INFO" "Installing Zsh plugin: $plugin_name"
+            if git_clone_or_update_user "$plugin_url" "$plugin_dir"; then
+                if verify_plugin_installation "$plugin_dir" "$plugin_name"; then
+                    log "INFO" "Successfully installed and verified: $plugin_name"
+                    ((success_count++))
+                else
+                    log "ERROR" "Installation verification failed for: $plugin_name"
+                fi
+            else
+                log "ERROR" "Failed to install Zsh plugin: $plugin_name"
+            fi
+        done
+        
+        log "INFO" "Zsh individual plugin installation completed: $success_count/$total_plugins successful"
+        
+        if [[ $success_count -eq 0 ]]; then
+            log "ERROR" "All Zsh plugins failed to install"
+        elif [[ $success_count -lt $total_plugins ]]; then
+            log "WARN" "Some Zsh plugins failed to install - check logs above for details"
+        fi
     fi
 else
-    log "INFO" "Skipping Zsh plugin installation - plugin directory does not exist"
+    log "ERROR" "Environment validation failed for Zsh plugins"
+    log "INFO" "Skipping Zsh plugin installation"
 fi
 
 if [[ -d "$oh_my_zsh_dir/custom" ]]; then
@@ -1723,18 +2344,62 @@ fi
 log "INFO" "Setting up Terraform version manager (tfenv)..."
 tfenv_dir="$TARGET_HOME/.tfenv"
 
-git_clone_or_update_user "https://github.com/tfutils/tfenv.git" "$tfenv_dir" "--depth=1"
-
-log "INFO" "Initializing tfenv..."
-run_as_user_with_home "'$tfenv_dir/bin/tfenv' init" 2>&1 || log "WARN" "tfenv init failed or already initialized"
-
-log "INFO" "Installing latest Terraform version..."
-run_as_user_with_home "'$tfenv_dir/bin/tfenv' install" 2>&1 || log "WARN" "tfenv install failed or already installed"
-
-log "INFO" "Setting Terraform version..."
-run_as_user_with_home "'$tfenv_dir/bin/tfenv' use" 2>&1 || log "WARN" "tfenv use failed or version already set"
-
-log "INFO" "Terraform version manager set up successfully"
+# Install tfenv with enhanced error checking
+if git_clone_or_update_user "https://github.com/tfutils/tfenv.git" "$tfenv_dir" "--depth=1"; then
+    # Verify tfenv installation
+    if [[ -f "$tfenv_dir/bin/tfenv" ]]; then
+        log "INFO" "tfenv cloned successfully, verifying installation..."
+        
+        # Make sure tfenv binary is executable
+        chmod +x "$tfenv_dir/bin/tfenv" 2>/dev/null || true
+        
+        # Test that tfenv is functional
+        if run_as_user_with_home "'$tfenv_dir/bin/tfenv' --version" >/dev/null 2>&1; then
+            log "INFO" "tfenv installation verified successfully"
+            
+            # Initialize tfenv
+            log "INFO" "Initializing tfenv..."
+            if run_as_user_with_home "'$tfenv_dir/bin/tfenv' init" 2>&1; then
+                log "INFO" "tfenv initialized successfully"
+            else
+                log "WARN" "tfenv init failed or already initialized"
+            fi
+            
+            # Install latest Terraform version
+            log "INFO" "Installing latest Terraform version..."
+            if run_as_user_with_home "'$tfenv_dir/bin/tfenv' install" 2>&1; then
+                log "INFO" "Latest Terraform version installed successfully"
+                
+                # Set the installed version as active
+                log "INFO" "Setting Terraform version..."
+                if run_as_user_with_home "'$tfenv_dir/bin/tfenv' use" 2>&1; then
+                    log "INFO" "Terraform version set successfully"
+                    
+                    # Verify final installation
+                    if run_as_user_with_home "'$tfenv_dir/bin/terraform' version" >/dev/null 2>&1; then
+                        log "INFO" "Terraform version manager setup completed and verified"
+                    else
+                        log "WARN" "tfenv installed but terraform command may not be working properly"
+                    fi
+                else
+                    log "WARN" "tfenv use failed - terraform version may not be set"
+                fi
+            else
+                log "WARN" "tfenv install failed - no Terraform version installed"
+            fi
+        else
+            log "ERROR" "tfenv binary is not functional after installation"
+        fi
+    else
+        log "ERROR" "tfenv binary not found after clone: $tfenv_dir/bin/tfenv"
+        log "INFO" "tfenv directory contents: $(ls -la "$tfenv_dir" 2>/dev/null || echo 'directory not accessible')"
+    fi
+else
+    log "ERROR" "Failed to clone tfenv repository"
+    log "INFO" "Terraform version manager installation failed"
+    log "INFO" "You can install tfenv manually later with:"
+    log "INFO" "  git clone https://github.com/tfutils/tfenv.git ~/.tfenv"
+fi
 
 # Commented out PowerShell module installation
 # This would require PowerShell to be installed and may need user interaction
@@ -1744,11 +2409,86 @@ log "INFO" "Terraform version manager set up successfully"
 #    run_as_user 'pwsh -NoProfile -NonInteractive -Command "Install-Module -Name z -Repository PSGallery -AllowClobber -Force"' || log "WARN" "Failed to install z module"
 #fi
 
-log "INFO" "Dotfiles installation completed successfully!"
+# Generate comprehensive installation summary
+generate_installation_summary() {
+    log "INFO" "=== DOTFILES INSTALLATION SUMMARY ==="
+    log "INFO" "Installation completed for user: $TARGET_USER"
+    log "INFO" "Configuration installed to: $TARGET_HOME"
+    
+    # Check status of major components
+    local summary_items=()
+    
+    # TMux plugins
+    if [[ -f "$TARGET_HOME/.tmux/plugins/tpm/tpm" ]]; then
+        summary_items+=("✓ TMux Plugin Manager (TPM): Successfully installed")
+    else
+        summary_items+=("✗ TMux Plugin Manager (TPM): Installation failed")
+    fi
+    
+    # Vim plugins
+    local vim_plugin_count
+    vim_plugin_count=$(find "$TARGET_HOME/.vim/pack/plugin/start" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    if [[ $vim_plugin_count -gt 0 ]]; then
+        summary_items+=("✓ Vim Plugins: $vim_plugin_count plugins installed")
+    else
+        summary_items+=("✗ Vim Plugins: No plugins found")
+    fi
+    
+    # Zsh plugins
+    if [[ -d "$TARGET_HOME/.oh-my-zsh" ]]; then
+        local zsh_plugin_count
+        zsh_plugin_count=$(find "$TARGET_HOME/.oh-my-zsh/custom/plugins" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+        if [[ $zsh_plugin_count -gt 0 ]]; then
+            summary_items+=("✓ Oh My Zsh: Installed with $zsh_plugin_count custom plugins")
+        else
+            summary_items+=("! Oh My Zsh: Installed but no custom plugins found")
+        fi
+    else
+        summary_items+=("✗ Oh My Zsh: Installation failed")
+    fi
+    
+    # tfenv
+    if [[ -f "$TARGET_HOME/.tfenv/bin/tfenv" ]]; then
+        summary_items+=("✓ Terraform Version Manager (tfenv): Successfully installed")
+    else
+        summary_items+=("✗ Terraform Version Manager (tfenv): Installation failed")
+    fi
+    
+    # Claude configuration
+    if [[ -d "$TARGET_HOME/.claude" ]]; then
+        summary_items+=("✓ Claude Code Configuration: Successfully deployed")
+    else
+        summary_items+=("✗ Claude Code Configuration: Deployment failed")
+    fi
+    
+    # VSCode configuration
+    if [[ -d "$TARGET_HOME/.vscode" ]]; then
+        summary_items+=("✓ VSCode Configuration: Successfully deployed")
+    else
+        summary_items+=("✗ VSCode Configuration: Deployment failed")
+    fi
+    
+    # Print summary
+    for item in "${summary_items[@]}"; do
+        if [[ "$item" =~ ^✓ ]]; then
+            log "INFO" "$item"
+        elif [[ "$item" =~ ^! ]]; then
+            log "WARN" "$item"
+        else
+            log "ERROR" "$item"
+        fi
+    done
+    
+    log "INFO" "======================================"
+}
+
+# Generate and display installation summary
+generate_installation_summary
+
+log "INFO" "Dotfiles installation completed!"
 
 if [[ "$CLOUD_INIT_MODE" == "true" ]]; then
     log "INFO" "Cloud-init installation completed for user: $TARGET_USER"
-    log "INFO" "Configuration installed to: $TARGET_HOME"
     log "INFO" "The user should restart their terminal or run 'source ~/.zshrc' to apply changes."
 else
     log "INFO" "Manual installation completed for user: $TARGET_USER"
@@ -1760,3 +2500,11 @@ if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
     log "INFO" "Files have been installed with proper ownership for user: $TARGET_USER"
     log "INFO" "The target user should log in and restart their shell to see the changes."
 fi
+
+# Provide troubleshooting information if there were failures
+log "INFO" "If any components failed to install:"
+log "INFO" "1. Check your network connectivity"
+log "INFO" "2. Ensure git is installed and accessible"
+log "INFO" "3. Verify you have proper permissions"
+log "INFO" "4. Re-run the script with DEBUG=1 for detailed diagnostics"
+log "INFO" "5. Check the installation logs above for specific error messages"
