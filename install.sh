@@ -792,7 +792,21 @@ check_mcp_dependencies() {
     return 0
 }
 
-# Install NPM packages globally for MCP servers
+# Check if NPM package is installed globally
+is_npm_package_installed_globally() {
+    local package_name="$1"
+    
+    # Check if package is installed globally using npm list -g
+    if [[ "$EUID" -eq 0 ]]; then
+        # Running as root - check system-wide global packages
+        npm list -g --depth=0 "$package_name" >/dev/null 2>&1
+    else
+        # Running as non-root user - check user's global packages
+        run_as_user_with_home "npm list -g --depth=0 '$package_name'" >/dev/null 2>&1
+    fi
+}
+
+# Install NPM packages for MCP servers with proper root/non-root handling
 install_mcp_server_package() {
     local server_name="$1"
     local package_name="$2"
@@ -802,14 +816,32 @@ install_mcp_server_package() {
         return 1
     fi
     
-    log "INFO" "Installing MCP server package: $server_name ($package_name)"
-    
-    # Try to install the package globally
-    if run_as_user_with_home "npm install -g '$package_name'" >/dev/null 2>&1; then
-        log "INFO" "Successfully installed MCP server: $server_name"
-        return 0
+    if [[ "$EUID" -eq 0 ]]; then
+        # Running as root - check if already installed globally, then install globally
+        if is_npm_package_installed_globally "$package_name"; then
+            log "INFO" "MCP server package already installed globally: $server_name ($package_name)"
+            return 0
+        fi
+        
+        log "INFO" "Installing MCP server package globally as root: $server_name ($package_name)"
+        if npm install -g "$package_name" >/dev/null 2>&1; then
+            log "INFO" "Successfully installed MCP server globally: $server_name"
+            return 0
+        else
+            log "WARN" "Failed to install MCP server package globally: $server_name"
+            return 1
+        fi
     else
-        log "WARN" "Failed to install MCP server package: $server_name"
+        # Running as non-root - first check if already installed globally (system-wide)
+        if npm list -g --depth=0 "$package_name" >/dev/null 2>&1; then
+            log "INFO" "MCP server package already installed globally (system-wide): $server_name ($package_name)"
+            return 0
+        fi
+        
+        # Non-root users cannot install global packages, so skip installation
+        log "INFO" "Running as non-root user - cannot install global npm packages"
+        log "INFO" "MCP server '$server_name' ($package_name) is not installed globally"
+        log "INFO" "To install this MCP server, run as root: sudo npm install -g $package_name"
         return 1
     fi
 }
@@ -954,9 +986,9 @@ install_environment_specific_mcp_servers() {
     # Azure environment servers
     if detect_environment_condition "azure_environment"; then
         log "INFO" "Azure environment detected, installing Azure MCP servers..."
-        # Using the actual Azure MCP server from your config
-        install_mcp_server_package "azure" "@azure/mcp-darwin-arm64" || true
-        install_mcp_server_package "microsoft-learn" "@microsoft/learn-mcp" || true
+        # Use the generic Azure MCP package which includes all platform-specific versions
+        install_mcp_server_package "azure" "@azure/mcp" || true
+        log "INFO" "Microsoft Learn MCP server is available as HTTP endpoint (configured via MCP config files)"
     fi
     
     # Terraform server if terraform is available
@@ -998,10 +1030,25 @@ setup_claude_symlink() {
     # Find the Claude binary
     claude_binary_path=$(find_claude_binary)
     if [[ -z "$claude_binary_path" ]]; then
-        log "WARN" "Claude binary not found. Skipping symlink creation."
-        log "INFO" "If you install Claude later, you can create the symlink manually:"
-        log "INFO" "  ln -sf /path/to/claude ~/.local/bin/claude"
-        return 0
+        log "WARN" "Claude binary not found. Installing Claude CLI..."
+        
+        # Install Claude using the official installer
+        log "INFO" "Downloading and installing Claude CLI..."
+        if run_as_user_with_home "curl -fsSL https://claude.ai/install.sh | bash -s latest" >/dev/null 2>&1; then
+            log "INFO" "Claude CLI installed successfully"
+            
+            # Try to find the binary again after installation
+            claude_binary_path=$(find_claude_binary)
+            if [[ -z "$claude_binary_path" ]]; then
+                log "WARN" "Claude binary still not found after installation. It may be installed in a location not in PATH."
+                log "INFO" "You may need to restart your shell or add Claude to your PATH manually."
+                return 0
+            fi
+        else
+            log "ERROR" "Failed to install Claude CLI automatically"
+            log "INFO" "Please install Claude manually using: curl -fsSL https://claude.ai/install.sh | bash -s latest"
+            return 0
+        fi
     fi
     
     # If the symlink target is already ~/.local/bin/claude, don't create a recursive symlink
@@ -1409,22 +1456,43 @@ safe_mkdir_user() {
             safe_mkdir_user "$parent_dir"
         fi
         
+        # Enhanced cloud-init compatibility: wait for filesystem to be ready
+        if [[ "$CLOUD_INIT_MODE" == "true" ]]; then
+            local fs_attempts=10  # Increased from 3 to 10 for better cloud-init compatibility
+            local fs_attempt=1
+            while [[ $fs_attempt -le $fs_attempts ]]; do
+                if [[ -w "$parent_dir" ]] || [[ "$EUID" -eq 0 ]]; then
+                    break
+                fi
+                log "INFO" "Waiting for filesystem to be ready for directory creation (attempt $fs_attempt/$fs_attempts)"
+                sleep 2  # Increased from 1 to 2 seconds
+                ((fs_attempt++))
+            done
+            
+            # Final check after waiting
+            if [[ $fs_attempt -gt $fs_attempts ]]; then
+                log "WARN" "Filesystem may not be fully ready after $fs_attempts attempts, proceeding anyway"
+            fi
+        fi
+        
         # Create the directory - use sudo if running as root for a different user
         if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
             # Running as root for another user - create as that user
-            sudo -u "$TARGET_USER" mkdir -p "$dir" 2>/dev/null || {
+            if ! sudo -u "$TARGET_USER" mkdir -p "$dir" 2>&1; then
+                log "WARN" "Failed to create directory as $TARGET_USER, attempting as root: $dir"
                 # If that fails, create as root and then set ownership
-                mkdir -p "$dir" || {
-                    log "ERROR" "Failed to create directory: $dir"
+                if ! mkdir -p "$dir"; then
+                    log "ERROR" "Failed to create directory even as root: $dir"
                     return 3
-                }
-            }
+                fi
+                log "INFO" "Created directory as root, will set ownership: $dir"
+            fi
         else
             # Regular creation
-            mkdir -p "$dir" || {
+            if ! mkdir -p "$dir"; then
                 log "ERROR" "Failed to create directory: $dir"
                 return 3
-            }
+            fi
         fi
 
         # Set proper ownership if running as root
@@ -1460,6 +1528,18 @@ safe_copy_user() {
 
     verify_file "$src"
 
+    # Special handling for sensitive configuration files - preserve if they contain authentication data
+    if [[ "$dest" == *"/settings.json" ]] || [[ "$dest" == *"/.credentials.json" ]] || [[ "$dest" == *"/claude_desktop_config.json" ]] || [[ "$dest" == *"/.gitconfig" ]] || [[ "$dest" == *"/.vscode/settings.json" ]]; then
+        if [[ -f "$dest" ]]; then
+            # Check if existing file contains authentication tokens or sensitive data
+            # Include VSCode-specific sensitive patterns and git helper patterns
+            if grep -q '"token"' "$dest" 2>/dev/null || grep -q '"sessionToken"' "$dest" 2>/dev/null || grep -q '"authToken"' "$dest" 2>/dev/null || grep -q '"apiKey"' "$dest" 2>/dev/null || grep -q '"credentials"' "$dest" 2>/dev/null || grep -q 'helper = !' "$dest" 2>/dev/null || grep -q '"github.copilot"' "$dest" 2>/dev/null || grep -q '"accessToken"' "$dest" 2>/dev/null || grep -q '"personal-access-token"' "$dest" 2>/dev/null; then
+                log "INFO" "Preserving existing file with authentication data: $(basename "$dest")"
+                return 0  # Skip copying this file to preserve sensitive data
+            fi
+        fi
+    fi
+
     if [[ -f "$dest" ]]; then
         log "INFO" "Backing up existing file: $dest -> $dest$backup_ext"
         cp "$dest" "$dest$backup_ext"
@@ -1476,6 +1556,78 @@ safe_copy_user() {
 
     # Set proper ownership if running as root
     set_ownership "$dest"
+}
+
+# Safely merge directory contents without overwriting existing directories
+safe_merge_directory() {
+    local src_dir="$1"
+    local dest_dir="$2"
+    local description="$3"
+    local backup_existing="${4:-false}"
+    
+    if [[ ! -d "$src_dir" ]]; then
+        log "WARN" "Source directory $src_dir not found, skipping $description"
+        return 0
+    fi
+    
+    log "INFO" "Merging $description from $src_dir to $dest_dir"
+    
+    # Create destination directory if it doesn't exist
+    safe_mkdir_user "$dest_dir"
+    
+    # Use find to copy all files while preserving directory structure
+    # Exclude runtime/temporary files that shouldn't be copied
+    find "$src_dir" -type f \( \
+        ! -path "*/logs/*" \
+        ! -path "*/shell-snapshots/*" \
+        ! -path "*/backups/*" \
+        ! -path "*/statsig/*" \
+        ! -path "*/todos/*" \
+        ! -path "*/projects/*" \
+        ! -name "*.backup.*" \
+    \) -print0 | while IFS= read -r -d '' src_file; do
+        # Calculate relative path from source directory
+        rel_path="${src_file#$src_dir/}"
+        dest_file="$dest_dir/$rel_path"
+        dest_subdir="$(dirname "$dest_file")"
+        
+        # Create subdirectory if needed
+        if [[ ! -d "$dest_subdir" ]]; then
+            safe_mkdir_user "$dest_subdir"
+        fi
+        
+        # Check if file already exists and backup if requested
+        if [[ -f "$dest_file" ]] && [[ "$backup_existing" == "true" ]]; then
+            local backup_ext=".backup.$(date +%Y%m%d_%H%M%S)"
+            log "INFO" "Backing up existing file: $dest_file -> $dest_file$backup_ext"
+            cp "$dest_file" "$dest_file$backup_ext"
+            set_ownership "$dest_file$backup_ext"
+        fi
+        
+        # Special handling for sensitive files - preserve if they contain authentication data
+        if [[ "$dest_file" == *"/settings.json" ]] || [[ "$dest_file" == *"/.credentials.json" ]] || [[ "$dest_file" == *"/claude_desktop_config.json" ]] || [[ "$dest_file" == *"/.vscode/settings.json" ]]; then
+            if [[ -f "$dest_file" ]]; then
+                # Check if existing file contains authentication tokens or sensitive data
+                # Include VSCode-specific sensitive patterns
+                if grep -q '"token"' "$dest_file" 2>/dev/null || grep -q '"sessionToken"' "$dest_file" 2>/dev/null || grep -q '"authToken"' "$dest_file" 2>/dev/null || grep -q '"apiKey"' "$dest_file" 2>/dev/null || grep -q '"credentials"' "$dest_file" 2>/dev/null || grep -q '"github.copilot"' "$dest_file" 2>/dev/null || grep -q '"accessToken"' "$dest_file" 2>/dev/null || grep -q '"personal-access-token"' "$dest_file" 2>/dev/null; then
+                    log "INFO" "Preserving existing file with authentication data: $rel_path"
+                    continue  # Skip copying this file to preserve sensitive data
+                fi
+            fi
+        fi
+        
+        # Copy file and overwrite if it exists
+        if [[ -f "$dest_file" ]]; then
+            log "INFO" "Overwriting existing file: $rel_path"
+        else
+            log "INFO" "Copying file: $rel_path"
+        fi
+        cp "$src_file" "$dest_file" || {
+            log "ERROR" "Failed to copy $src_file to $dest_file"
+            continue
+        }
+        set_ownership "$dest_file"
+    done
 }
 
 # Enhanced git clone or update with comprehensive error handling
@@ -1658,6 +1810,53 @@ detect_execution_context
 # Setup target user and home directory
 setup_target_user
 
+# Create essential directories early to ensure they exist before any operations
+# This is particularly important for cloud-init contexts where operations may fail silently
+ensure_essential_directories() {
+    log "INFO" "Creating essential directories for user $TARGET_USER..."
+    
+    # Core directories that should always exist
+    safe_mkdir_user "$TARGET_HOME/.local"
+    safe_mkdir_user "$TARGET_HOME/.local/bin"
+    safe_mkdir_user "$TARGET_HOME/.cache"
+    safe_mkdir_user "$TARGET_HOME/.config"
+    
+    # Tool-specific directories
+    safe_mkdir_user "$TARGET_HOME/.azure"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-posh"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-posh/themes"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-zsh"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-zsh/custom"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-zsh/custom/plugins"
+    safe_mkdir_user "$TARGET_HOME/.tfenv"
+    safe_mkdir_user "$TARGET_HOME/.tfenv/bin"
+    safe_mkdir_user "$TARGET_HOME/.tmux"
+    safe_mkdir_user "$TARGET_HOME/.tmux/plugins"
+    safe_mkdir_user "$TARGET_HOME/.vim"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin/start"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/themes"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/themes/start"
+    safe_mkdir_user "$TARGET_HOME/.vscode"
+    safe_mkdir_user "$TARGET_HOME/.vscode-insiders"
+    safe_mkdir_user "$TARGET_HOME/.vscode-server"
+    safe_mkdir_user "$TARGET_HOME/.vscode-server-insiders"
+    safe_mkdir_user "$TARGET_HOME/.claude"
+    
+    # Create .z file for z jump tool
+    if [[ ! -f "$TARGET_HOME/.z" ]]; then
+        touch "$TARGET_HOME/.z"
+        set_ownership "$TARGET_HOME/.z"
+        log "INFO" "Created .z file for z jump tool"
+    fi
+    
+    log "INFO" "Essential directories created successfully"
+}
+
+# Ensure all essential directories exist early in the process
+ensure_essential_directories
+
 # Override HOME with target home if different user
 if [[ "$TARGET_USER" != "$SCRIPT_USER" ]]; then
     export HOME="$TARGET_HOME"
@@ -1785,91 +1984,24 @@ log "INFO" "Setting up Claude Code configuration..."
 claude_dir="$TARGET_HOME/.claude"
 claude_source_dir="./.claude"
 
-# Function to copy Claude directory structure recursively
-copy_claude_directory() {
-    local src_dir="$1"
-    local dest_dir="$2"
-    local description="$3"
-    
-    if [[ ! -d "$src_dir" ]]; then
-        log "WARN" "Source directory $src_dir not found, skipping $description"
-        return 0
-    fi
-    
-    log "INFO" "Copying $description from $src_dir to $dest_dir"
-    
-    # Create destination directory if it doesn't exist
-    safe_mkdir_user "$dest_dir"
-    
-    # Use find to copy all files while preserving directory structure
-    # Exclude sensitive files that shouldn't be copied
-    find "$src_dir" -type f \( \
-        ! -name ".credentials.json" \
-        ! -path "*/logs/*" \
-        ! -path "*/shell-snapshots/*" \
-        ! -path "*/backups/*" \
-        ! -path "*/statsig/*" \
-        ! -path "*/todos/*" \
-        ! -path "*/projects/*" \
-        ! -name "*.backup.*" \
-    \) -print0 | while IFS= read -r -d '' src_file; do
-        # Calculate relative path from source directory
-        rel_path="${src_file#$src_dir/}"
-        dest_file="$dest_dir/$rel_path"
-        dest_subdir="$(dirname "$dest_file")"
-        
-        # Create subdirectory if needed
-        if [[ ! -d "$dest_subdir" ]]; then
-            safe_mkdir_user "$dest_subdir"
-        fi
-        
-        # Copy file with backup and proper ownership
-        safe_copy_user "$src_file" "$dest_file"
-        
-        log "INFO" "Copied Claude file: $rel_path"
-    done
-}
-
-
-# Backup existing .claude directory if it exists
-if [[ -d "$claude_dir" ]]; then
-    backup_ext=".backup.$(date +%Y%m%d_%H%M%S)"
-    log "INFO" "Backing up existing Claude configuration: $claude_dir -> $claude_dir$backup_ext"
-    mv "$claude_dir" "$claude_dir$backup_ext"
-    set_ownership "$claude_dir$backup_ext" true
-fi
-
-# Copy the entire .claude directory structure (excluding sensitive files)
-copy_claude_directory "$claude_source_dir" "$claude_dir" "Claude Code configuration"
+# Safely merge Claude directory contents without overwriting existing directory
+safe_merge_directory "$claude_source_dir" "$claude_dir" "Claude Code configuration" false
 
 
 # Set proper permissions and ownership for the Claude directory
 set_claude_permissions "$claude_dir"
 
 # Setup MCP servers
-log "INFO" "Setting up MCP servers..."
 setup_mcp_servers
 
-log "INFO" "Claude Code configuration setup completed"
-
 # Setup Claude binary symlink
-log "INFO" "Setting up Claude binary symlink..."
 setup_claude_symlink
 
-log "INFO" "Setting up VSCode configuration..."
 vscode_dir="$TARGET_HOME/.vscode"
 
-if [[ -d "$vscode_dir" ]]; then
-    log "INFO" "Backing up existing $vscode_dir directory..."
-    backup_ext=".backup.$(date +%Y%m%d_%H%M%S)"
-    mv "$vscode_dir" "$vscode_dir$backup_ext"
-    set_ownership "$vscode_dir$backup_ext" true
-fi
-
+# Safely merge VSCode directory contents without overwriting existing directory
 if [[ -d .vscode ]]; then
-    cp -a .vscode "$vscode_dir"
-    set_ownership "$vscode_dir" true
-    log "INFO" "VSCode configuration set up successfully"
+    safe_merge_directory ".vscode" "$vscode_dir" "VSCode configuration" false
 else
     log "WARN" "VSCode configuration directory not found in dotfiles"
 fi
@@ -1884,54 +2016,79 @@ log_environment_state "tmux setup"
 
 # Validate environment before proceeding with tmux setup
 if validate_plugin_environment "TMux plugins" "git"; then
-    safe_mkdir_user "$TARGET_HOME/.tmux"
-    safe_mkdir_user "$TARGET_HOME/.tmux/plugins"
+    # Enhanced cloud-init compatibility with retry logic for filesystem operations
+    local max_attempts=5
+    local attempt=1
+    local tmux_setup_success=false
     
-    log "INFO" "Attempting to clone tmux plugin manager (TPM)..."
-        if git_clone_or_update_user "https://github.com/tmux-plugins/tpm" "$TARGET_HOME/.tmux/plugins/tpm"; then
-            # Enhanced verification using the new verification function
-            if verify_plugin_installation "$TARGET_HOME/.tmux/plugins/tpm" "tpm"; then
-                log "INFO" "TPM installation completed and verified successfully"
-                log "INFO" "TPM installed at: $TARGET_HOME/.tmux/plugins/tpm"
-                
-                # Additional verification - check if TPM is executable
-                if [[ -x "$TARGET_HOME/.tmux/plugins/tpm/tpm" ]]; then
-                    log "INFO" "TPM script is executable and ready to use"
+    while [[ $attempt -le $max_attempts ]] && [[ "$tmux_setup_success" == "false" ]]; do
+        if [[ $attempt -gt 1 ]]; then
+            log "INFO" "Retrying tmux setup (attempt $attempt/$max_attempts)..."
+            sleep 2
+        fi
+        
+        # Verify target home is writable
+        if [[ -w "$TARGET_HOME" ]] || [[ "$EUID" -eq 0 ]]; then
+            if safe_mkdir_user "$TARGET_HOME/.tmux" && safe_mkdir_user "$TARGET_HOME/.tmux/plugins"; then
+                log "INFO" "Attempting to clone tmux plugin manager (TPM)..."
+                if git_clone_or_update_user "https://github.com/tmux-plugins/tpm" "$TARGET_HOME/.tmux/plugins/tpm"; then
+                    # Enhanced verification using the new verification function
+                    if verify_plugin_installation "$TARGET_HOME/.tmux/plugins/tpm" "tpm"; then
+                        log "INFO" "TPM installation completed and verified successfully"
+                        log "INFO" "TPM installed at: $TARGET_HOME/.tmux/plugins/tpm"
+                        
+                        # Additional verification - check if TPM is executable
+                        if [[ -x "$TARGET_HOME/.tmux/plugins/tpm/tpm" ]]; then
+                            log "INFO" "TPM script is executable and ready to use"
+                        else
+                            log "WARN" "TPM script exists but may not be executable"
+                            # Try to fix permissions
+                            chmod +x "$TARGET_HOME/.tmux/plugins/tpm/tpm" 2>/dev/null || log "WARN" "Could not fix TPM script permissions"
+                        fi
+                        tmux_setup_success=true
+                    else
+                        log "ERROR" "TPM installation verification failed (attempt $attempt/$max_attempts)"
+                        log "INFO" "Tmux configuration will work, but plugins will not be available"
+                    fi
                 else
-                    log "WARN" "TPM script exists but may not be executable"
-                    # Try to fix permissions
-                    chmod +x "$TARGET_HOME/.tmux/plugins/tpm/tpm" 2>/dev/null || log "WARN" "Could not fix TPM script permissions"
+                    log "WARN" "Git clone failed for tmux plugins (attempt $attempt/$max_attempts)"
                 fi
             else
-                log "ERROR" "TPM installation verification failed"
-                log "INFO" "Tmux configuration will work, but plugins will not be available"
+                log "WARN" "Failed to create tmux directories (attempt $attempt/$max_attempts)"
             fi
         else
-            log "ERROR" "Failed to install tmux plugin manager (TPM)"
-            log "INFO" "Tmux configuration will work, but plugins will not be available"
-            
-            # Enhanced diagnostics for troubleshooting
-            log "INFO" "=== TPM Installation Diagnostics ==="
-            log "INFO" "Target directory: $TARGET_HOME/.tmux/plugins/tpm"
-            log "INFO" "Directory exists: $([[ -d "$TARGET_HOME/.tmux/plugins/tpm" ]] && echo 'yes' || echo 'no')"
-            log "INFO" "Parent directory exists: $([[ -d "$TARGET_HOME/.tmux/plugins" ]] && echo 'yes' || echo 'no')"
-            log "INFO" "Parent directory writable: $([[ -w "$TARGET_HOME/.tmux/plugins" ]] && echo 'yes' || echo 'no')"
-            log "INFO" "Target home accessible: $([[ -d "$TARGET_HOME" && -r "$TARGET_HOME" ]] && echo 'yes' || echo 'no')"
-            if [[ -d "$TARGET_HOME/.tmux/plugins/tpm" ]]; then
-                log "INFO" "Directory contents: $(ls -la "$TARGET_HOME/.tmux/plugins/tpm" 2>/dev/null | wc -l) items"
-                if [[ -f "$TARGET_HOME/.tmux/plugins/tpm/tpm" ]]; then
-                    log "INFO" "TPM script exists but installation reported as failed"
-                else
-                    log "INFO" "TPM directory exists but script is missing"
-                fi
+            log "WARN" "Target home directory not writable: $TARGET_HOME (attempt $attempt/$max_attempts)"
+        fi
+        
+        ((attempt++))
+    done
+    
+    if [[ "$tmux_setup_success" == "false" ]]; then
+        log "ERROR" "Failed to set up tmux plugins after $max_attempts attempts"
+        log "INFO" "This may be due to filesystem mounting timing during cloud-init"
+        
+        # Enhanced diagnostics for troubleshooting
+        log "INFO" "=== TPM Installation Diagnostics ==="
+        log "INFO" "Target directory: $TARGET_HOME/.tmux/plugins/tpm"
+        log "INFO" "Directory exists: $([[ -d "$TARGET_HOME/.tmux/plugins/tpm" ]] && echo 'yes' || echo 'no')"
+        log "INFO" "Parent directory exists: $([[ -d "$TARGET_HOME/.tmux/plugins" ]] && echo 'yes' || echo 'no')"
+        log "INFO" "Parent directory writable: $([[ -w "$TARGET_HOME/.tmux/plugins" ]] && echo 'yes' || echo 'no')"
+        log "INFO" "Target home accessible: $([[ -d "$TARGET_HOME" && -r "$TARGET_HOME" ]] && echo 'yes' || echo 'no')"
+        if [[ -d "$TARGET_HOME/.tmux/plugins/tpm" ]]; then
+            log "INFO" "Directory contents: $(ls -la "$TARGET_HOME/.tmux/plugins/tpm" 2>/dev/null | wc -l) items"
+            if [[ -f "$TARGET_HOME/.tmux/plugins/tpm/tpm" ]]; then
+                log "INFO" "TPM script exists but installation reported as failed"
+            else
+                log "INFO" "TPM directory exists but script is missing"
             fi
-            log "INFO" "Git available: $(command_exists git && echo 'yes' || echo 'no')"
-            log "INFO" "Network connectivity: $(check_github_connectivity >/dev/null 2>&1 && echo 'ok' || echo 'failed')"
-            log "INFO" "Current user: $(whoami)"
-            log "INFO" "Target user: $TARGET_USER"
-            log "INFO" "Running as root: $([[ "$EUID" -eq 0 ]] && echo 'yes' || echo 'no')"
-            log "INFO" "================================"
-            
+        fi
+        log "INFO" "Git available: $(command_exists git && echo 'yes' || echo 'no')"
+        log "INFO" "Network connectivity: $(check_github_connectivity >/dev/null 2>&1 && echo 'ok' || echo 'failed')"
+        log "INFO" "Current user: $(whoami)"
+        log "INFO" "Target user: $TARGET_USER"
+        log "INFO" "Running as root: $([[ "$EUID" -eq 0 ]] && echo 'yes' || echo 'no')"
+        log "INFO" "================================"
+        
         log "INFO" "To manually install TPM later, run:"
         log "INFO" "  git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
     fi
@@ -2400,6 +2557,101 @@ else
     log "INFO" "You can install tfenv manually later with:"
     log "INFO" "  git clone https://github.com/tfutils/tfenv.git ~/.tfenv"
 fi
+
+# Ensure all expected directories exist (fallback for cloud-init compatibility)
+if [[ "$CLOUD_INIT_MODE" == "true" ]]; then
+    log "INFO" "Ensuring all expected directories exist for cloud-init compatibility..."
+    
+    # Create directories that might be missing due to failed network operations or plugin installations
+    safe_mkdir_user "$TARGET_HOME/.azure"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-posh"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-posh/themes"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-zsh"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-zsh/custom"
+    safe_mkdir_user "$TARGET_HOME/.oh-my-zsh/custom/plugins"
+    safe_mkdir_user "$TARGET_HOME/.tfenv"
+    safe_mkdir_user "$TARGET_HOME/.tfenv/bin"
+    safe_mkdir_user "$TARGET_HOME/.tmux"
+    safe_mkdir_user "$TARGET_HOME/.tmux/plugins" 
+    safe_mkdir_user "$TARGET_HOME/.vim"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/plugin/start"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/themes"
+    safe_mkdir_user "$TARGET_HOME/.vim/pack/themes/start"
+    safe_mkdir_user "$TARGET_HOME/.vscode"
+    safe_mkdir_user "$TARGET_HOME/.vscode-insiders"
+    safe_mkdir_user "$TARGET_HOME/.vscode-server"
+    safe_mkdir_user "$TARGET_HOME/.vscode-server-insiders"
+    
+    # Create empty .z file if it doesn't exist (for z jump tool)
+    if [[ ! -f "$TARGET_HOME/.z" ]]; then
+        touch "$TARGET_HOME/.z"
+        set_ownership "$TARGET_HOME/.z"
+    fi
+    
+    log "INFO" "Cloud-init directory structure validation completed"
+    
+    # Verify all expected directories were actually created
+    verify_directory_structure
+fi
+
+# Verify directory structure function
+verify_directory_structure() {
+    log "INFO" "Verifying directory structure..."
+    
+    local missing_dirs=()
+    local expected_dirs=(
+        ".azure"
+        ".cache"
+        ".claude"
+        ".config"
+        ".local"
+        ".local/bin"
+        ".oh-my-posh"
+        ".oh-my-posh/themes"
+        ".oh-my-zsh"
+        ".oh-my-zsh/custom"
+        ".oh-my-zsh/custom/plugins"
+        ".tfenv"
+        ".tfenv/bin"
+        ".tmux"
+        ".tmux/plugins"
+        ".vim"
+        ".vim/pack"
+        ".vim/pack/plugin"
+        ".vim/pack/plugin/start"
+        ".vim/pack/themes"
+        ".vim/pack/themes/start"
+        ".vscode"
+        ".vscode-insiders"
+        ".vscode-server"
+        ".vscode-server-insiders"
+    )
+    
+    for dir in "${expected_dirs[@]}"; do
+        if [[ ! -d "$TARGET_HOME/$dir" ]]; then
+            missing_dirs+=("$dir")
+            log "WARN" "Directory missing: $TARGET_HOME/$dir"
+        fi
+    done
+    
+    # Check for .z file
+    if [[ ! -f "$TARGET_HOME/.z" ]]; then
+        log "WARN" "File missing: $TARGET_HOME/.z"
+    fi
+    
+    if [[ ${#missing_dirs[@]} -gt 0 ]]; then
+        log "ERROR" "The following directories are missing: ${missing_dirs[*]}"
+        log "INFO" "Attempting to create missing directories..."
+        for dir in "${missing_dirs[@]}"; do
+            safe_mkdir_user "$TARGET_HOME/$dir"
+        done
+        log "INFO" "Retry completed for missing directories"
+    else
+        log "INFO" "All expected directories verified successfully"
+    fi
+}
 
 # Commented out PowerShell module installation
 # This would require PowerShell to be installed and may need user interaction
