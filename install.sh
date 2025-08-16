@@ -21,7 +21,7 @@
 #   3 - File system error
 #   4 - Permission error
 
-set -euo pipefail  # Exit on error, undefined vars, pipe failures
+set -uo pipefail  # Exit on undefined vars, pipe failures (but not on command errors)
 
 # Enable debug mode if DEBUG environment variable is set
 if [[ "${DEBUG:-}" == "1" ]]; then
@@ -147,7 +147,9 @@ setup_target_user() {
     # Validate target user exists
     if ! user_exists "$TARGET_USER"; then
         log "ERROR" "User '$TARGET_USER' does not exist"
-        exit 1
+        log "ERROR" "Cannot proceed with installation for non-existent user"
+        ((ERROR_COUNT++))
+        # This is a critical error but we'll still try to continue with script validation
     fi
 
     # Set target home directory
@@ -169,17 +171,17 @@ setup_target_user() {
         log "WARN" "Home directory '$TARGET_HOME' does not exist, attempting to create it"
         # Try to create the home directory if running as root
         if [[ "$EUID" -eq 0 ]]; then
-            mkdir -p "$TARGET_HOME" || {
-                log "ERROR" "Failed to create home directory '$TARGET_HOME'"
-                exit 1
-            }
-            # Set proper ownership for the home directory
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$TARGET_HOME"
-            chmod 755 "$TARGET_HOME"
-            log "INFO" "Created home directory: $TARGET_HOME"
+            if safe_execute "mkdir -p '$TARGET_HOME'"; then
+                # Set proper ownership for the home directory
+                safe_execute "chown '$TARGET_USER:$(id -gn "$TARGET_USER")' '$TARGET_HOME'"
+                safe_execute "chmod 755 '$TARGET_HOME'"
+                log "INFO" "Created home directory: $TARGET_HOME"
+            else
+                log "ERROR" "Failed to create home directory '$TARGET_HOME', continuing with remaining installation"
+            fi
         else
             log "ERROR" "Home directory '$TARGET_HOME' does not exist and cannot create it without root privileges"
-            exit 1
+            log "INFO" "Attempting to continue installation with existing directories"
         fi
     fi
 
@@ -196,6 +198,34 @@ log() {
     local level="$1"
     shift
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] [dotfiles install.sh] $*" >&2
+}
+
+# Global error counter
+ERROR_COUNT=0
+
+# Log command errors but continue execution
+log_command_error() {
+    local command="$1"
+    local exit_code="$2"
+    local line_number="${3:-unknown}"
+    
+    ((ERROR_COUNT++))
+    log "ERROR" "Command failed (line $line_number, exit code $exit_code): $command"
+    log "INFO" "Continuing execution... (total errors so far: $ERROR_COUNT)"
+}
+
+# Execute command with error logging but continue on failure
+safe_execute() {
+    local command="$*"
+    local line_number="${BASH_LINENO[0]:-unknown}"
+    
+    if eval "$command"; then
+        return 0
+    else
+        local exit_code=$?
+        log_command_error "$command" "$exit_code" "$line_number"
+        return $exit_code
+    fi
 }
 
 # Debug logging for troubleshooting
@@ -224,12 +254,11 @@ log_environment_state() {
     debug_log "============================="
 }
 
-# Error handling function
+# Error handling function (updated to not exit immediately)
 handle_error() {
     local exit_code=$?
     local line_number=$1
-    log "ERROR" "Script failed at line $line_number with exit code $exit_code"
-    exit $exit_code
+    log_command_error "Script error at line $line_number" "$exit_code" "$line_number"
 }
 
 # Set proper ownership helper function
@@ -239,9 +268,9 @@ set_ownership() {
     
     if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
         if [[ "$recursive" == "true" ]]; then
-            chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$path"
+            safe_execute "chown -R '$TARGET_USER:$(id -gn "$TARGET_USER")' '$path'"
         else
-            chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$path"
+            safe_execute "chown '$TARGET_USER:$(id -gn "$TARGET_USER")' '$path'"
         fi
     fi
 }
@@ -1075,7 +1104,7 @@ setup_claude_symlink() {
     
     # Create the symlink
     log "INFO" "Creating Claude symlink: $symlink_path -> $claude_binary_path"
-    ln -sf "$claude_binary_path" "$symlink_path"
+    safe_execute "ln -sf '$claude_binary_path' '$symlink_path'"
     
     # Set proper ownership if running as root
     set_ownership "$symlink_path"
@@ -1789,7 +1818,9 @@ declare -r SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Validate we're in the correct directory
 if [[ ! -f "$SCRIPT_DIR/install.sh" ]]; then
     log "ERROR" "Script must be run from the dotfiles directory"
-    exit 1
+    log "ERROR" "Cannot continue without proper script location"
+    ((ERROR_COUNT++))
+    # This is critical, but we'll let the script continue to show other potential issues
 fi
 
 ## --- MAIN SCRIPT EXECUTION ---
@@ -2327,22 +2358,22 @@ cd "${DOTFILEDIR}" || {
 
 # Only attempt to modify plugins line if $zshrc_file exists
 if [[ -f "$zshrc_file" ]]; then
-    tmpfile=$(mktemp) || {
-        log "ERROR" "Failed to create temporary file"
-        exit 3
-    }
-    # Ensure cleanup of temporary file
-    trap 'rm -f "$tmpfile"' EXIT
-    if sed 's/^plugins=.*$/plugins=(git zsh-syntax-highlighting zsh-autosuggestions ubuntu jsontools gh common-aliases conda-zsh-completion zsh-aliases-lsd zsh-tfenv z pip docker)/' "$zshrc_file" > "$tmpfile"; then
-        mv "$tmpfile" "$zshrc_file" || {
-            log "ERROR" "Failed to update .zshrc"
-            exit 3
-        }
-        # Set proper ownership if running as root
-        set_ownership "$zshrc_file"
+    if tmpfile=$(mktemp); then
+        # Ensure cleanup of temporary file
+        trap 'rm -f "$tmpfile"' EXIT
+        if sed 's/^plugins=.*$/plugins=(git zsh-syntax-highlighting zsh-autosuggestions ubuntu jsontools gh common-aliases conda-zsh-completion zsh-aliases-lsd zsh-tfenv z pip docker)/' "$zshrc_file" > "$tmpfile"; then
+            if ! safe_execute "mv '$tmpfile' '$zshrc_file'"; then
+                log "ERROR" "Failed to update .zshrc, but continuing installation"
+            fi
+            # Set proper ownership if running as root
+            set_ownership "$zshrc_file"
+        else
+            log "ERROR" "Failed to modify .zshrc content, but continuing installation"
+            log_command_error "sed modification of .zshrc" "1" "${LINENO}"
+        fi
     else
-        log "ERROR" "Failed to modify .zshrc content"
-        exit 3
+        log "ERROR" "Failed to create temporary file for .zshrc modification"
+        log_command_error "mktemp for .zshrc" "1" "${LINENO}"
     fi
 else
     log "WARN" "$zshrc_file not found, skipping plugins configuration update."
@@ -2443,18 +2474,19 @@ if [[ "$(uname)" == "Linux" ]]; then
                 safe_mkdir_user "$TARGET_HOME/.local/bin"
             else
                 log "ERROR" "Target home directory does not exist: $TARGET_HOME"
-                exit 3
+                log "ERROR" "Cannot install lsd without valid target home, but continuing installation"
+                log_command_error "lsd installation - missing target home" "1" "${LINENO}"
+                return 1
             fi
 
             # Move binary and set ownership
-            mv "$lsd_dir/lsd" "$TARGET_HOME/.local/bin/" || {
-                log "ERROR" "Failed to move lsd binary"
-                exit 3
-            }
-
-            # Set proper ownership and permissions
-            set_ownership "$TARGET_HOME/.local/bin/lsd"
-            chmod +x "$TARGET_HOME/.local/bin/lsd"
+            if safe_execute "mv '$lsd_dir/lsd' '$TARGET_HOME/.local/bin/'"; then
+                # Set proper ownership and permissions
+                set_ownership "$TARGET_HOME/.local/bin/lsd"
+                safe_execute "chmod +x '$TARGET_HOME/.local/bin/lsd'"
+            else
+                log "ERROR" "Failed to move lsd binary, but continuing installation"
+            fi
         )
 
         log "INFO" "lsd installed successfully"
@@ -2753,6 +2785,14 @@ if [[ "$EUID" -eq 0 ]] && [[ "$SCRIPT_USER" != "$TARGET_USER" ]]; then
     log "INFO" "The target user should log in and restart their shell to see the changes."
 fi
 
+# Final error summary
+if [[ $ERROR_COUNT -eq 0 ]]; then
+    log "SUCCESS" "Installation completed successfully with no errors"
+else
+    log "WARNING" "Installation completed with $ERROR_COUNT error(s)"
+    log "INFO" "Review the error messages above for details on failed commands"
+fi
+
 # Provide troubleshooting information if there were failures
 log "INFO" "If any components failed to install:"
 log "INFO" "1. Check your network connectivity"
@@ -2760,3 +2800,8 @@ log "INFO" "2. Ensure git is installed and accessible"
 log "INFO" "3. Verify you have proper permissions"
 log "INFO" "4. Re-run the script with DEBUG=1 for detailed diagnostics"
 log "INFO" "5. Check the installation logs above for specific error messages"
+
+# Exit with error code if there were failures, but only after completing all operations
+if [[ $ERROR_COUNT -gt 0 ]]; then
+    exit 1
+fi
