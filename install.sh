@@ -1932,6 +1932,28 @@ setup_shell_config() {
         fi
     fi
     
+    # Add tfenv to PATH if it exists
+    local tfenv_export='export PATH=$HOME/.tfenv/bin:$PATH'
+    if [[ -d "$TARGET_HOME/.tfenv/bin" ]]; then
+        if ! grep -q "export PATH=.*\.tfenv/bin" "$shellrc"; then
+            add_to_shell_config "$shellrc" "$tfenv_export" "export PATH=.*\.tfenv/bin" "\$HOME/.tfenv/bin to PATH"
+        else
+            # Check if it's using hardcoded path and replace it
+            if grep -q "export PATH=.*/root/\.tfenv/bin" "$shellrc" && ! grep -q "export PATH=.*\$HOME.*\.tfenv/bin" "$shellrc"; then
+                log "INFO" "Replacing hardcoded tfenv path with \$HOME variable in $shellrc"
+                # Replace hardcoded path with $HOME version
+                if [[ "$(uname)" == "Darwin" ]]; then
+                    sed -i '' "s|export PATH=\"*/root/\.tfenv/bin:\$PATH\"|${tfenv_export}|g" "$shellrc"
+                    sed -i '' "s|export PATH=.*/root/\.tfenv/bin:\$PATH|${tfenv_export}|g" "$shellrc"
+                else
+                    sed -i "s|export PATH=\"*/root/\.tfenv/bin:\$PATH\"|${tfenv_export}|g" "$shellrc"
+                    sed -i "s|export PATH=.*/root/\.tfenv/bin:\$PATH|${tfenv_export}|g" "$shellrc"
+                fi
+                set_ownership "$shellrc"
+            fi
+        fi
+    fi
+    
     # Add GitHub CLI pager configuration
     add_to_shell_config "$shellrc" 'export GH_PAGER=' "export GH_PAGER=" "GitHub CLI pager configuration"
 }
@@ -2533,8 +2555,28 @@ fi
 log "INFO" "Setting up Terraform version manager (tfenv)..."
 tfenv_dir="$TARGET_HOME/.tfenv"
 
+# Check if we should skip tfenv installation (e.g., when pre-installed by cloud-init)
+if [[ "${SKIP_TFENV_INSTALL:-}" == "1" ]] && [[ -d "$tfenv_dir/.git" ]]; then
+    log "INFO" "tfenv already installed (SKIP_TFENV_INSTALL=1), verifying installation..."
+    # Update the existing repository
+    if (cd "$tfenv_dir" && git pull --quiet 2>/dev/null); then
+        log "INFO" "tfenv repository updated successfully"
+    else
+        log "WARN" "Failed to update tfenv repository, using existing version"
+    fi
+    tfenv_install_result=0
+elif [[ -d "$tfenv_dir" ]] && [[ ! -d "$tfenv_dir/.git" ]]; then
+    # Directory exists but is not a git repository - clean it up
+    log "WARN" "tfenv directory exists but is not a git repository, cleaning up..."
+    rm -rf "$tfenv_dir"
+    tfenv_install_result=$(git_clone_or_update_user "https://github.com/tfutils/tfenv.git" "$tfenv_dir" "--depth=1" && echo 0 || echo 1)
+else
+    # Normal installation or update
+    tfenv_install_result=$(git_clone_or_update_user "https://github.com/tfutils/tfenv.git" "$tfenv_dir" "--depth=1" && echo 0 || echo 1)
+fi
+
 # Install tfenv with enhanced error checking
-if git_clone_or_update_user "https://github.com/tfutils/tfenv.git" "$tfenv_dir" "--depth=1"; then
+if [[ "$tfenv_install_result" == "0" ]] || [[ -d "$tfenv_dir/.git" ]]; then
     # Verify tfenv installation
     if [[ -f "$tfenv_dir/bin/tfenv" ]]; then
         log "INFO" "tfenv cloned successfully, verifying installation..."
