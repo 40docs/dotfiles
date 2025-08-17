@@ -2623,9 +2623,6 @@ if [[ "$CLOUD_INIT_MODE" == "true" ]]; then
     fi
     
     log "INFO" "Cloud-init directory structure validation completed"
-    
-    # Verify all expected directories were actually created
-    verify_directory_structure
 fi
 
 # Verify directory structure function
