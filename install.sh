@@ -2503,7 +2503,7 @@ if [[ -f "$oh_my_posh_bin" ]]; then
         if run_as_user_with_home "'$oh_my_posh_bin' font install Meslo" 2>/dev/null; then
             log "INFO" "Meslo font installation completed successfully"
         else
-            local exit_code=$?
+            exit_code=$?
             log "DEBUG" "oh-my-posh font install returned exit code $exit_code"
             
             # Verify if fonts were actually installed despite the error
