@@ -2519,53 +2519,139 @@ else
 fi
 
 log "INFO" "Installing Meslo font (non-interactive)..."
-oh_my_posh_bin="$TARGET_HOME/.local/bin/oh-my-posh"
-if [[ -f "$oh_my_posh_bin" ]]; then
-    # Check if Meslo Nerd Font is already installed
-    if fc-list | grep -q "MesloLG.*Nerd Font"; then
-        log "INFO" "Meslo Nerd Font already installed, skipping installation"
-    else
-        log "INFO" "Attempting Meslo font installation via oh-my-posh..."
-        # Attempt installation with detailed error handling
-        if run_as_user_with_home "'$oh_my_posh_bin' font install Meslo" 2>/dev/null; then
-            log "INFO" "Meslo font installation completed successfully"
+
+# Enhanced Meslo font installation with cloud-init coordination
+# This addresses GitHub issue #395: Meslo font installation failure
+install_meslo_fonts() {
+    local USER_FONT_DIR="$TARGET_HOME/.local/share/fonts"
+    local TEMP_DIR
+    local MESLO_VERSION="v3.3.0"
+    local oh_my_posh_bin="$TARGET_HOME/.local/bin/oh-my-posh"
+    
+    # Create user font directory
+    mkdir -p "$USER_FONT_DIR"
+    
+    # Enhanced detection to check for Meslo fonts in all locations
+    has_meslo_fonts() {
+        # Method 1: Check via fontconfig (most reliable)
+        if fc-list 2>/dev/null | grep -qi "meslo.*nerd\|MesloLG"; then
+            return 0
+        fi
+        # Method 2: Check system font directories
+        if ls /usr/share/fonts/truetype/meslo/MesloLG*.ttf >/dev/null 2>&1 || \
+           ls /usr/share/fonts/truetype/meslo/Meslo*.ttf >/dev/null 2>&1; then
+            return 0
+        fi
+        # Method 3: Check user font directory
+        if ls "$USER_FONT_DIR"/MesloLG*.ttf >/dev/null 2>&1 || \
+           ls "$USER_FONT_DIR"/Meslo*.ttf >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    }
+    
+    # Check if cloud-init already installed fonts
+    if [[ -n "${MESLO_FONTS_INSTALLED:-}" ]] || [[ -f "/etc/environment" ]] && grep -q "MESLO_FONTS_INSTALLED=true" /etc/environment 2>/dev/null; then
+        log "INFO" "Meslo fonts already installed by cloud-init, verifying availability..."
+        if has_meslo_fonts; then
+            log "INFO" "Meslo fonts verified - installation complete"
+            return 0
         else
-            exit_code=$?
-            log "DEBUG" "oh-my-posh font install returned exit code $exit_code"
-            
-            # Verify if fonts were actually installed despite the error
-            if fc-list | grep -q "MesloLG.*Nerd Font"; then
-                log "INFO" "Meslo Nerd Fonts detected post-installation - installation succeeded"
-                log "INFO" "Note: oh-my-posh font installer may report errors in non-interactive environments"
-            else
-                log "WARN" "Meslo font installation failed - fonts not detected after installation attempt"
-                log "INFO" "Alternative: Install fonts manually via system package manager or direct download"
-                log "INFO" "Fallback command: apt install fonts-powerline fonts-firacode 2>/dev/null || true"
-                
-                # Attempt fallback installation via apt if available
-                if command -v apt >/dev/null 2>&1; then
-                    log "INFO" "Attempting fallback font installation via apt..."
-                    if apt install -y fonts-powerline fonts-firacode 2>/dev/null; then
-                        log "INFO" "Fallback font installation via apt completed successfully"
-                    else
-                        log "DEBUG" "Fallback apt installation also failed, continuing without specialized fonts"
-                    fi
-                fi
+            log "WARN" "Cloud-init reported font installation but fonts not detected, attempting user-level installation..."
+        fi
+    fi
+    
+    # Check if fonts are already installed
+    if has_meslo_fonts; then
+        log "INFO" "Meslo Nerd Fonts already available, skipping installation"
+        return 0
+    fi
+    
+    log "INFO" "Installing Meslo Nerd Fonts to user directory..."
+    
+    # Method 1: Try oh-my-posh font installer (if available)
+    if [[ -f "$oh_my_posh_bin" ]]; then
+        log "INFO" "Attempting Meslo font installation via oh-my-posh..."
+        if run_as_user_with_home "'$oh_my_posh_bin' font install Meslo" 2>/dev/null; then
+            log "INFO" "oh-my-posh font installation completed"
+            # Refresh font cache and verify
+            run_as_user_with_home "fc-cache -f '$USER_FONT_DIR'" 2>/dev/null || true
+            sleep 2
+            if has_meslo_fonts; then
+                log "INFO" "Meslo fonts successfully installed via oh-my-posh"
+                return 0
             fi
         fi
+        log "DEBUG" "oh-my-posh font installation failed or fonts not detected, trying direct download..."
     fi
-else
-    log "WARN" "oh-my-posh not found, skipping font installation"
-    log "INFO" "Installing basic terminal fonts via package manager..."
-    # Attempt to install basic terminal fonts when oh-my-posh is not available
-    if command -v apt >/dev/null 2>&1; then
-        if apt install -y fonts-powerline fonts-firacode 2>/dev/null; then
-            log "INFO" "Basic terminal fonts installed successfully via apt"
+    
+    # Method 2: Direct download from GitHub releases
+    log "INFO" "Downloading Meslo Nerd Fonts directly from GitHub..."
+    TEMP_DIR=$(mktemp -d)
+    DOWNLOAD_SUCCESS=false
+    
+    # Download with retry logic
+    for attempt in 1 2 3; do
+        log "DEBUG" "Download attempt $attempt/3..."
+        if curl -fsSL --connect-timeout 30 --max-time 300 \
+           "https://github.com/ryanoasis/nerd-fonts/releases/download/$MESLO_VERSION/Meslo.zip" \
+           -o "$TEMP_DIR/Meslo.zip"; then
+            DOWNLOAD_SUCCESS=true
+            log "INFO" "Download successful on attempt $attempt"
+            break
         else
-            log "DEBUG" "Basic font installation via apt failed, continuing without specialized fonts"
+            log "WARN" "Download attempt $attempt failed"
+            [[ $attempt -lt 3 ]] && sleep $((attempt * 2))
+        fi
+    done
+    
+    if [[ "$DOWNLOAD_SUCCESS" == "true" ]]; then
+        log "INFO" "Extracting and installing Meslo fonts to user directory..."
+        
+        if unzip -q "$TEMP_DIR/Meslo.zip" -d "$TEMP_DIR"; then
+            # Install fonts to user directory
+            find "$TEMP_DIR" -name "MesloLGS*.ttf" -exec cp {} "$USER_FONT_DIR/" \; 2>/dev/null || true
+            find "$TEMP_DIR" -name "Meslo*.ttf" -exec cp {} "$USER_FONT_DIR/" \; 2>/dev/null || true
+            
+            # Set proper permissions for the user
+            run_as_user_with_home "chmod 644 '$USER_FONT_DIR'/*.ttf" 2>/dev/null || true
+            
+            # Refresh font cache as user
+            run_as_user_with_home "fc-cache -f '$USER_FONT_DIR'" 2>/dev/null || true
+            run_as_user_with_home "fc-cache -f" 2>/dev/null || true
+            
+            # Wait for font cache refresh
+            sleep 3
+            
+            # Verify installation
+            if has_meslo_fonts; then
+                log "INFO" "Meslo Nerd Fonts successfully installed to user directory"
+            else
+                log "WARN" "Meslo fonts installed but verification failed - fonts may still work"
+            fi
+        else
+            log "ERROR" "Failed to extract Meslo font archive"
+        fi
+    else
+        log "ERROR" "Failed to download Meslo fonts after 3 attempts"
+    fi
+    
+    # Cleanup
+    rm -rf "$TEMP_DIR"
+    
+    # Method 3: Fallback to package manager fonts
+    if ! has_meslo_fonts && command -v apt >/dev/null 2>&1; then
+        log "INFO" "Attempting fallback font installation via package manager..."
+        if apt install -y fonts-powerline fonts-firacode 2>/dev/null; then
+            log "INFO" "Fallback fonts installed successfully via apt"
+        else
+            log "DEBUG" "Package manager font installation also failed"
         fi
     fi
-fi
+}
+
+# Execute enhanced font installation
+install_meslo_fonts
 
 log "INFO" "Copying powerlevel10k theme..."
 if [[ -f powerlevel10k.omp.json ]]; then
@@ -2574,6 +2660,7 @@ else
     log "WARN" "powerlevel10k.omp.json not found in dotfiles"
 fi
 
+oh_my_posh_bin="$TARGET_HOME/.local/bin/oh-my-posh"
 if [[ -f "$oh_my_posh_bin" ]]; then
     run_as_user_with_home "'$oh_my_posh_bin' disable notice"
 fi
